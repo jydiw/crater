@@ -1,1 +1,24 @@
 CLAUDE.md
+.DS_Store
+.vscode/settings.json
+/tests
+
+# Python
+*.pyc
+*.pyo
+__pycache__/
+*.egg-info/
+dist/
+
+# Environments
+.venv/
+venv/
+
+# Tools
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# crater runtime files
+*.db
+*.csv
