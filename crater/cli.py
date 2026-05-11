@@ -8,6 +8,7 @@ from crater import config as cfg_mod
 from crater.db.connection import open_db
 from crater.tags.api import apply_diff, generate_diff, read_diff_csv, write_diff_csv
 from crater.tags.errors import CraterError
+from crater.tags.lookup import LookupConfig, RealMbClient
 
 
 def _default_review_path(library_root: Path) -> Path:
@@ -27,6 +28,7 @@ def _resolve_out_path(out: Path | None, library_root: Path) -> Path:
 # ---------------------------------------------------------------------------
 # Root group
 # ---------------------------------------------------------------------------
+
 
 @click.group()
 @click.option(
@@ -55,6 +57,7 @@ def main(ctx: click.Context, library: str | None) -> None:
 # `crater tags` subgroup
 # ---------------------------------------------------------------------------
 
+
 @main.group()
 def tags() -> None:
     """Tag management commands."""
@@ -62,13 +65,26 @@ def tags() -> None:
 
 @tags.command("diff")
 @click.argument("paths", nargs=-1, type=click.Path(exists=True, path_type=Path))
-@click.option("--out", type=click.Path(path_type=Path), default=None,
-              help="Output CSV path. Relative paths resolve under the library root. "
-                   "Default: {library_root}/review/YYYY-MM-DD-HHMMSS.csv")
-@click.option("--track", "track_ids", multiple=True, type=int,
-              help="Restrict to track IDs (repeatable).")
-@click.option("--source", type=click.Choice(["earliest", "acquired"]), default=None,
-              help="Which release to prefer for MB tags. Overrides config.")
+@click.option(
+    "--out",
+    type=click.Path(path_type=Path),
+    default=None,
+    help="Output CSV path. Relative paths resolve under the library root. "
+    "Default: {library_root}/review/YYYY-MM-DD-HHMMSS.csv",
+)
+@click.option(
+    "--track",
+    "track_ids",
+    multiple=True,
+    type=int,
+    help="Restrict to track IDs (repeatable).",
+)
+@click.option(
+    "--source",
+    type=click.Choice(["earliest", "acquired"]),
+    default=None,
+    help="Which release to prefer for MB tags. Overrides config.",
+)
 @click.pass_context
 def tags_diff(
     ctx: click.Context,
@@ -92,12 +108,28 @@ def tags_diff(
     prefer = source or cfg_mod.tags_prefer(crater_cfg)
     preserve_if_set = cfg_mod.tags_preserve_if_set(crater_cfg)
 
+    try:
+        acoustid_key = cfg_mod.require_acoustid_key(crater_cfg)
+    except CraterError as exc:
+        click.echo(f"error: {exc}", err=True)
+        sys.exit(1)
+
+    lookup_cfg = LookupConfig(
+        prefer=prefer,  # type: ignore[arg-type]
+        preserve_if_set=tuple(preserve_if_set),
+        acoustid_skip=cfg_mod.tags_acoustid_skip(crater_cfg),
+        acoustid_high=cfg_mod.tags_acoustid_high(crater_cfg),
+        acoustid_medium=cfg_mod.tags_acoustid_medium(crater_cfg),
+    )
+    client = RealMbClient(acoustid_key=acoustid_key)
+
     conn = open_db(db_path)
     diffs = generate_diff(
         conn,
         list(paths),
-        prefer=prefer,
-        preserve_if_set=preserve_if_set,
+        client=client,
+        lookup_cfg=lookup_cfg,
+        progress=lambda line: click.echo(line),
     )
     conn.close()
 
@@ -113,12 +145,16 @@ def tags_diff(
 
 @tags.command("apply")
 @click.argument("csv_file", type=click.Path(path_type=Path))
-@click.option("--dry-run", is_flag=True, default=False,
-              help="Show what would be written without touching files or DB.")
-@click.option("--force", is_flag=True, default=False,
-              help="Write even if drift is detected.")
-@click.option("--yes", is_flag=True, default=False,
-              help="Skip confirmation prompt.")
+@click.option(
+    "--dry-run",
+    is_flag=True,
+    default=False,
+    help="Show what would be written without touching files or DB.",
+)
+@click.option(
+    "--force", is_flag=True, default=False, help="Write even if drift is detected."
+)
+@click.option("--yes", is_flag=True, default=False, help="Skip confirmation prompt.")
 @click.pass_context
 def tags_apply(
     ctx: click.Context,
@@ -165,7 +201,9 @@ def tags_apply(
     click.echo(f"applied {result.applied} field change(s) in batch {result.batch_id}.")
 
     if result.skipped_review:
-        click.echo(f"  skipped {result.skipped_review} row(s) with decision=review/reject.")
+        click.echo(
+            f"  skipped {result.skipped_review} row(s) with decision=review/reject."
+        )
     if result.skipped_drift:
         click.echo(
             f"  skipped {len(result.skipped_drift)} field(s) due to drift "

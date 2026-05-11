@@ -13,11 +13,12 @@ No diff rows are produced until MB lookup is implemented.
 
 import csv
 import sqlite3
+from collections.abc import Callable, Iterable
 from pathlib import Path
-from typing import Iterable
 
 from crater.db.repo import TrackRepo
 from crater.tags.io import detect_format, read_tags
+from crater.tags.lookup import LookupConfig, MbClient, lookup_track
 from crater.tags.models import TAGGABLE_FIELDS, TrackDiff, TrackTags
 
 _META_FIELDS: tuple[str, ...] = (
@@ -69,24 +70,44 @@ def generate_diff(
     conn: sqlite3.Connection,
     paths: Iterable[Path],
     *,
-    preserve_if_set: Iterable[str] = (),
+    client: MbClient | None = None,
+    lookup_cfg: LookupConfig | None = None,
+    progress: Callable[[str], None] | None = None,
 ) -> list[TrackDiff]:
     """Register tracks and return MB-proposed diffs.
 
     before = current file state; after = MB proposals.
-    Returns [] until MB lookup is implemented; tracks are still registered.
-    preserve_if_set: fields to skip if the file already has a value (e.g. bpm).
+    If `client` is None, only registration happens and no diffs are returned.
     """
-    _ = set(preserve_if_set)  # reserved for the MB-lookup path
-
+    registered: list[tuple[int, Path]] = []
     for path in paths:
         path = path.resolve()
         if not path.exists():
             continue
-        _register_track(conn, path)
+        tid = _register_track(conn, path)
+        registered.append((tid, path))
 
-    # MB lookup not yet implemented — no diff rows.
-    return []
+    if client is None or not registered:
+        return []
+
+    cfg = lookup_cfg or LookupConfig()
+    repo = TrackRepo(conn)
+    diffs: list[TrackDiff] = []
+    total = len(registered)
+    for i, (tid, path) in enumerate(registered, 1):
+        row = repo.get_by_id(tid)
+        assert row is not None
+        diff = lookup_track(conn, client, row, lookup_cfg=cfg)
+        if progress is not None:
+            label = f"{row['artist'] or '?'} — {row['title'] or path.name}"
+            if diff is None:
+                progress(f"[{i}/{total}] {label} … skipped")
+            else:
+                n = len(diff.changed_fields())
+                progress(f"[{i}/{total}] {label} … {n} change(s)")
+        if diff is not None and diff.changed_fields():
+            diffs.append(diff)
+    return diffs
 
 
 def write_diff_csv(diffs: list[TrackDiff], out: Path) -> None:

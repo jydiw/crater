@@ -27,6 +27,9 @@ CREATE TABLE track (
     release_mbid    TEXT,
     earliest_mbid   TEXT,
 
+    mb_confidence     REAL,
+    tags_reviewed_at  INTEGER,
+
     acquired_at     INTEGER NOT NULL,
     created_at      INTEGER NOT NULL DEFAULT (strftime('%s','now')),
     updated_at      INTEGER NOT NULL DEFAULT (strftime('%s','now'))
@@ -56,6 +59,12 @@ CREATE TABLE change (
 ) STRICT;
 CREATE INDEX idx_change_track ON change(track_id, changed_at);
 CREATE INDEX idx_change_batch ON change(batch_id);
+
+CREATE TABLE mb_cache (
+    recording_mbid TEXT PRIMARY KEY,
+    payload        TEXT NOT NULL,
+    fetched_at     INTEGER NOT NULL DEFAULT (strftime('%s','now'))
+) STRICT;
 
 CREATE TABLE schema_version (
     version     INTEGER PRIMARY KEY,

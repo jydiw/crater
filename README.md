@@ -7,12 +7,11 @@ and organizes files into a canonical store with symlink-based views.
 
 | Module | Status |
 |--------|--------|
-| `tags diff` | Working (file→DB, no MB lookup) |
+| `tags diff` | Working (registration + AcoustID/MusicBrainz lookup) |
 | `tags apply` | Working |
 | `tags revert` | Planned |
 | `tags history` | Planned |
 | `tags forget / prune` | Planned |
-| MusicBrainz lookup | Planned |
 | `store` / `ingest` | Planned |
 | `keys` | Planned |
 | `views` | Planned |
@@ -41,8 +40,12 @@ Create `~/.config/crater/config.toml`:
 library_root = "/path/to/your/dj/library"
 
 [tags]
-prefer = "earliest"          # or "acquired" — which MB release drives album/year/label
-acoustid_key = "YOUR_KEY"    # https://acoustid.org/login
+prefer = "earliest"                # or "acquired" — which MB release drives album/year/label
+preserve_if_set = ["bpm"]          # never overwrite these fields when the file already has a value
+acoustid_key = "YOUR_KEY"          # https://acoustid.org/login
+acoustid_skip_threshold = 0.90     # skip fingerprinting when stored confidence ≥ this
+acoustid_high_threshold = 0.90     # score ≥ this → decision=accept (auto)
+acoustid_medium_threshold = 0.75   # score ≥ this → decision=review (medium confidence)
 ```
 
 Or use environment variables:
@@ -68,36 +71,55 @@ The library root must exist and will hold:
 
 ### `crater tags diff`
 
-Compares each file's on-disk tags to the database and writes a CSV for review.
-On first run, auto-registers the file in the database.
+Registers any new files in the database (file tags → DB) and runs an AcoustID
+fingerprint + MusicBrainz lookup against each one. Tracks where MB has
+something to propose are written to a review CSV.
 
 ```bash
-# Compare one or more files to DB (no MusicBrainz lookup)
-crater tags diff track.flac --no-lookup
+# Register + look up one or more files
+crater tags diff track.flac
 
 # Multiple files
-crater tags diff ~/Downloads/*.mp3 --no-lookup
+crater tags diff ~/Downloads/*.mp3
 
-# Save to a specific file (default: ./crater-diff-<timestamp>.csv)
-crater tags diff track.flac --no-lookup --out /tmp/review.csv
+# Save to a specific file (default: {library_root}/review/YYYY-MM-DD-HHMMSS.csv)
+crater tags diff track.flac --out tmp/review.csv
 ```
 
-The output CSV has one row per changed field:
+Progress prints one line per track:
 
 ```
-batch_ref,track_id,path,field,old_value,new_value,source,confidence,decision,override_value,notes
+[1/3] Aphex Twin — Xtal … 4 change(s)
+[2/3] ? — unknown.flac … skipped
+[3/3] Boards of Canada — Roygbiv … 2 change(s)
 ```
 
-Edit the CSV in a spreadsheet or text editor, then set the `decision` column:
+The review CSV has **two rows per track** (`row_kind = before | after`) with
+one column per taggable field. Editing an `after` cell is an implicit override.
+The per-track `decision` column on the `after` row is one of:
 
 | `decision` value | Effect |
 |---|---|
-| `accept` | Write `new_value` to DB |
-| `reject` | Skip this field |
-| `override` | Write `override_value` instead |
-| `review` | Skip and report (hasn't been decided yet) |
+| `accept` | Write the `after` row's values |
+| `reject` | Skip this track |
+| `review` | Skip and leave for later (default for medium-/low-confidence matches) |
 
-Default for `--no-lookup` diffs: all rows start as `accept`.
+Confidence bands (driven by AcoustID score):
+
+| Score | `confidence` | Default `decision` |
+|---|---|---|
+| ≥ 0.90 | `high` | `accept` |
+| 0.75–0.90 | `medium` | `review` |
+| < 0.75 | `low` | `review` |
+
+**Lookup short-circuits:**
+- Tracks where you've already accepted a diff (`tags_reviewed_at` is set) are
+  skipped entirely.
+- Tracks with a stored confidence ≥ `acoustid_skip_threshold` skip the
+  fingerprint step and go straight to MusicBrainz (cache-first).
+
+MusicBrainz responses are cached in the `mb_cache` table, so re-running `diff`
+on the same files doesn't hit the network again.
 
 ### `crater tags apply`
 

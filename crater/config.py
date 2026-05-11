@@ -20,13 +20,19 @@ _CONFIG_TEMPLATE = """\
 # CRATER_LIBRARY_ROOT env var overrides this
 
 [tags]
-prefer = "earliest"              # "earliest" | "acquired"
-preserve_if_set = ["bpm"]        # never propose overwriting these if already tagged
-# acoustid_key = "YOUR_KEY"      # https://acoustid.org/login
-                                 # ACOUSTID_KEY env var overrides this
+prefer = "earliest"                # "earliest" | "acquired"
+preserve_if_set = ["bpm"]          # never propose overwriting these if already tagged
+acoustid_skip_threshold = 0.90     # skip fingerprint when stored score ≥ this
+acoustid_high_threshold = 0.90     # score ≥ this → decision=accept, confidence=high
+acoustid_medium_threshold = 0.75   # score ≥ this → confidence=medium (review)
+# acoustid_key = "YOUR_KEY"        # https://acoustid.org/login
+                                   # ACOUSTID_KEY env var overrides this
 """
 
 _DEFAULT_PRESERVE_IF_SET: tuple[str, ...] = ("bpm",)
+_DEFAULT_SKIP_THRESHOLD = 0.90
+_DEFAULT_HIGH_THRESHOLD = 0.90
+_DEFAULT_MEDIUM_THRESHOLD = 0.75
 
 
 def _scaffold_config(path: Path) -> None:
@@ -99,3 +105,25 @@ def tags_preserve_if_set(cfg: dict[str, object]) -> list[str]:
             f"got {type(val).__name__}"
         )
     return [str(f) for f in val]
+
+
+def _float_from_tags(cfg: dict[str, object], key: str, default: float) -> float:
+    tags = cfg.get("tags", {})
+    assert isinstance(tags, dict)
+    val = tags.get(key, default)
+    try:
+        return float(val)  # type: ignore[arg-type]
+    except (TypeError, ValueError) as e:
+        raise ConfigError(f"tags.{key} must be a number, got {val!r}") from e
+
+
+def tags_acoustid_skip(cfg: dict[str, object]) -> float:
+    return _float_from_tags(cfg, "acoustid_skip_threshold", _DEFAULT_SKIP_THRESHOLD)
+
+
+def tags_acoustid_high(cfg: dict[str, object]) -> float:
+    return _float_from_tags(cfg, "acoustid_high_threshold", _DEFAULT_HIGH_THRESHOLD)
+
+
+def tags_acoustid_medium(cfg: dict[str, object]) -> float:
+    return _float_from_tags(cfg, "acoustid_medium_threshold", _DEFAULT_MEDIUM_THRESHOLD)

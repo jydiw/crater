@@ -1,6 +1,7 @@
 """Apply an approved diff CSV to the DB (and file tags when the file needs updating)."""
 
 import sqlite3
+import time
 from pathlib import Path
 
 from crater.db.repo import BatchRepo, ChangeRepo, TrackRepo
@@ -131,7 +132,9 @@ def _apply_track(
             return
 
     db_updates: dict[str, object] = {f: _to_db_value(f, v) for f, v in updates.items()}
-    TrackRepo(conn).update_tags(d.track_id, db_updates)
+    repo = TrackRepo(conn)
+    repo.update_tags(d.track_id, db_updates)
+    repo.mark_reviewed(d.track_id, int(time.time()))
 
     change_repo = ChangeRepo(conn)
     for field_name, before_val, after_val in history:

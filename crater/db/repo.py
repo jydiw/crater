@@ -1,3 +1,4 @@
+import json
 import sqlite3
 from pathlib import Path
 
@@ -52,6 +53,54 @@ class TrackRepo:
 
     def get_orphaned(self) -> list[sqlite3.Row]:
         return [r for r in self.list_all() if not Path(r["path"]).exists()]
+
+    def set_mb_confidence(self, track_id: int, score: float | None) -> None:
+        self._conn.execute(
+            "UPDATE track SET mb_confidence = ? WHERE id = ?",
+            (score, track_id),
+        )
+        self._conn.commit()
+
+    def mark_reviewed(self, track_id: int, when: int) -> None:
+        self._conn.execute(
+            "UPDATE track SET tags_reviewed_at = ? WHERE id = ?",
+            (when, track_id),
+        )
+        self._conn.commit()
+
+
+class MbCacheRepo:
+    def __init__(self, conn: sqlite3.Connection) -> None:
+        self._conn = conn
+
+    def get(self, recording_mbid: str) -> dict | None:
+        row = self._conn.execute(
+            "SELECT payload FROM mb_cache WHERE recording_mbid = ?",
+            (recording_mbid,),
+        ).fetchone()
+        if row is None:
+            return None
+        return json.loads(row["payload"])
+
+    def put(self, recording_mbid: str, payload: dict) -> None:
+        self._conn.execute(
+            """
+            INSERT INTO mb_cache (recording_mbid, payload)
+            VALUES (?, ?)
+            ON CONFLICT(recording_mbid) DO UPDATE SET
+                payload = excluded.payload,
+                fetched_at = strftime('%s','now')
+            """,
+            (recording_mbid, json.dumps(payload)),
+        )
+        self._conn.commit()
+
+    def delete(self, recording_mbid: str) -> None:
+        self._conn.execute(
+            "DELETE FROM mb_cache WHERE recording_mbid = ?",
+            (recording_mbid,),
+        )
+        self._conn.commit()
 
 
 class BatchRepo:
