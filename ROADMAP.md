@@ -1,8 +1,8 @@
 # crater roadmap — macOS app direction
 
-Status: adopted 2026-07-03. Supersedes the "Build order" section of CLAUDE.md.
-Context: personal tool for one DJ, not distributed. Licensing notes below only
-matter if that changes.
+Status: adopted 2026-07-03, revised 2026-07-30. Supersedes the "Build order"
+section of CLAUDE.md. Context: personal tool for one DJ, not distributed.
+Licensing notes below only matter if that changes.
 
 ## What changed and why
 
@@ -25,6 +25,26 @@ existing Python engine — with native multi-source metadata adapters.** The CSV
 review workflow was always a stand-in for a review UI; the app is its
 successor, not a replacement for the engine. The CLI survives throughout.
 
+### Revision 2026-07-30
+
+Priorities reordered around what the user actually needs now: standardized ID3
+tags, and playlists that land in rekordbox. The user over-acquires music and
+plays little of it, and finds rekordbox itself hard to work in — so culling and
+slicing the library along acquired date, genre, and key has to happen inside
+crater. That pulls the library browser + playlists + rekordbox export from last
+place to directly after the app shell. Album art moves up with it, into the
+adapters phase.
+
+Two phases fall away. Key detection now lives in **rille**
+(`~/Documents/GitHub/rille`), a separate crater-agnostic key-research tool the
+user built: its own SQLite DB keyed by audio content hash, nine detectors plus
+a majority-vote ensemble, and its own audition/review UI. crater consumes
+rille's manually-confirmed keys over a `content_hash` join instead of growing a
+detection engine, benchmark harness, and review screen of its own. Views /
+symlink trees are shelved — in-app filtering slices the library the same way
+without a filesystem tree to keep in sync. The store's physical migration is
+deferred as well: crater computes `content_hash` in place, no file moves.
+
 ## Decision log
 
 | decision | choice | rationale | revisit if |
@@ -38,6 +58,10 @@ successor, not a replacement for the engine. The CLI survives throughout.
 | Fingerprinting | Optional — text-match MB first, AcoustID only for mystery files | Store-bought files arrive well-tagged; AcoustID needs a (free) signup | text matching proves unreliable |
 | beets / OneTagger | Reference implementations, never dependencies | See above | — |
 | GPL hygiene | No OneTagger code copied in-tree; endpoints/field names are facts, fine to learn | Keeps crater MIT-clean | — |
+| Key detection | Owned by rille, a separate repo; crater imports confirmed keys over a `content_hash` join | rille is deliberately crater-agnostic (its own DB, detectors, review UI); folding it in would couple a research tool's churn to crater's schema, and crater only ever needs the final answer | rille stalls, or crater needs keys for files rille has never seen |
+| Rekordbox integration | XML export | XML is rekordbox's supported import bridge — playlists, file paths, cues. pyrekordbox can write the encrypted DB directly, but that path is reverse-engineered and breaks on rekordbox updates | XML proves too lossy for a needed field; pyrekordbox is then the fallback, accepted as fragile |
+| `content_hash` | Computed in place — no `store/` directory, no file moves, yet | Unblocks the rille join and duplicate detection immediately; moving files is orthogonal and can wait | see the store migration note under Parked — the rekordbox wrinkle sets the deadline |
+| Views / symlink trees | Shelved indefinitely | In-app browser filtering does the same slicing, with no derived tree to rebuild, relink, or let drift | in-app browsing proves insufficient, or another tool needs filesystem-shaped access |
 
 ## Source strategy (keyless-first)
 
@@ -47,9 +71,10 @@ successor, not a replacement for the engine. The CLI survives throughout.
 | MusicBrainz genres (`inc=genres`) | none | genre (generic but free) | P1 |
 | Deezer API | none | **per-track BPM**, release date, album genre | P1 |
 | iTunes Search API | none | genre (Apple taxonomy), release date | P1 |
-| Cover Art Archive | none | album art (deferred milestone from tags slice) | P1+ |
+| Cover Art Archive | none | album art (embedded, not just fetched) | P1 |
 | AcoustID | free key, one signup | fingerprint → recording MBID — **built**, becomes optional | done |
-| Beatport | none (scraping) | DJ-accurate genre, key, BPM, catalog # | P6 |
+| rille | none — local SQLite DB | key + `key_source`, joined on `content_hash` | P4 |
+| Beatport | none (scraping) | DJ-accurate genre, key, BPM, catalog # | parked |
 | Discogs | free personal token | label/catalog depth | parked |
 | Spotify | app registration; audio-features API deprecated | — | skip |
 
@@ -69,12 +94,13 @@ Opus for multi-file or design-sensitive phases. Tags below are suggestions.
 Every phase ends with: full pytest pass, README.md updated, project memory
 updated.
 
-### P0 — finish the tags CLI slice  [Sonnet/Opus mix; already planned]
+### P0 — finish the tags engine slice  [done 2026-07-30]
 Deliver: `crater tags revert BATCH_ID` (drift detection), `crater tags
-history`, `crater tags forget`, `crater tags prune`.
+history`, `crater tags forget`, `crater tags prune`, and the thin Click
+wrappers over each.
 Verify: pytest; manual round-trip — apply a batch, revert it, history shows both.
 
-### P1 — metadata source adapters + merge policy  [Opus: design-sensitive]
+### P1 — metadata source adapters + merge policy + album art  [Opus: design-sensitive]
 - Generalize the lookup layer: a `MetadataSource` protocol (the existing
   `MbClient` Protocol is the seed). Each adapter returns per-field proposals
   with provenance.
@@ -82,9 +108,13 @@ Verify: pytest; manual round-trip — apply a batch, revert it, history shows bo
   text-search (makes fingerprinting optional), MB genres on the existing client.
 - Merge policy: `[tags.sources]` config, provenance recorded in the CSV
   `notes`/a new `source` column so review shows where each value came from.
+- Album art: Cover Art Archive fetch keyed on `release_mbid`, embedded as ID3
+  `APIC` / FLAC picture block. Skip if the file already carries art unless
+  forced; art changes go through the same batch/history record as text tags.
 - Respect per-source rate limits (extend `ratelimit.py`).
 Verify: stub-based tests per adapter (mock network layer, per repo convention);
-live smoke on 3 real files showing BPM from Deezer + genre merge order.
+live smoke on 3 real files showing BPM from Deezer + genre merge order + art
+embedded and readable back by mutagen.
 
 ### P2 — app skeleton + tag review screen  [Opus: new surface]
 - `crater/app/` — UI as static web files + a JSON bridge, runnable two ways:
@@ -100,102 +130,87 @@ Verify: in `--dev` mode, run a diff against fixtures, accept 2 / reject 1,
 confirm `tag_batches` + `tag_history` rows match; same flow smoke-checked once
 in the pywebview window; engine test suite untouched.
 
-### P3 — store + ingest engine, then ingest screen  [Opus engine, Sonnet screen]
-- Engine as designed in CLAUDE.md: content-hash store, staging sweep,
-  `acquired_at` from `st_birthtime`, `content_hash` backfill via one UPDATE.
-- Screen 2: drag files from Finder → staging → watch hash/ingest/lookup.
-Verify: ingest fixtures, re-ingest same file dedupes, backfill UPDATE row
-count; drag-drop smoke test in app.
-
-### P4 — keys engine, then key review screen  [Opus engine, Sonnet screen]
-**Flagged risk — the roadmap's lowest-confidence phase, and not because of the
-code.** Textbook K-S detection lands ~60–75% on electronic music; fixture tests
-will pass while real-world detections disappoint. Expectation: the baseline is
-a starting point, and the review workflow exists *because* detection is
-imperfect. Do not skip the benchmark step.
-- Engine as designed: librosa Krumhansl-Schmuckler baseline, canonical 24-key
-  table, `key_source` lifecycle, `crater keys detect/confirm/review` CLI.
-  Pin librosa/numba versions known to support Python 3.13 at execution time.
-- Benchmark before trusting: ground truth is (a) keys the user has manually
-  confirmed — `key_source = 'manual'` accumulates this for free during review —
-  and (b) the GiantSteps Key / GiantSteps-MTG datasets (Beatport EDM excerpts
-  with expert-corrected annotations; load via `mirdata`). Beatport's own keys
-  are a *noisy reference only* — the user finds them unreliable, which is also
-  why GiantSteps exists. Score with `mir_eval.key` (MIREX weighting) plus plain
-  accuracy. Cheap known wins if the number is poor: HPSS preprocessing, segment
-  voting, Essentia's EDM-tuned `edma`/`edmm` profiles, madmom's key CNN as an
-  alternative backend.
-- The detector sits behind a small interface (audio path → pitch class, mode,
-  confidence). The user plans a crater-agnostic key-research package as a side
-  project (eval-harness-first; calibrated "unknown" abstention is the research
-  angle that fits crater's review queue). crater is that package's labeling
-  tool and first consumer; the librosa baseline here is just backend #1.
-- Screen 3: key review — in-app audio playback (HTML5 `<audio>` served over
-  the localhost bridge), waveform overview strip (peaks computed in Python,
-  canvas render) so the user can seek to the drop, confirm/correct key, sets
-  `key_source = manual`.
-- Prior art for the screen's feel: OneTagger's QuickTag (hotkey-driven rapid
-  review). If energy tagging (see Candidate features) is adopted, capture it
-  on this screen with hotkeys — one listening pass yields key + energy — and
-  add the column in this phase's migration.
-Verify: detection tests on self-authored tonal fixtures (known-key sine/chord
-renders); canonicalization table test covers all 24 spellings; benchmark
-accuracy reported against the labeled set; playback + confirm smoke test.
-
-### P5 — views  [Sonnet: well-specified]
-Symlink trees as designed: default views, user-defined templates + filters,
-`rebuild`/`relink`.
-Verify: rebuild against a seeded DB, tree structure matches a SQL query's
-expectation; relink after moving a temp library root.
-
-### P6 — Beatport adapter  [Opus; optional, explicitly rot-owned]
-- Scraping, contained in one adapter module behind the same `MetadataSource`
-  protocol. Study OneTagger's beatport module for endpoint/field shape
-  (learn facts, don't copy code).
-- Must degrade gracefully: markup shift → adapter returns nothing, run
-  continues (same contract as lookup errors today).
-- Spike first: verify current Beatport page structure before committing.
-Verify: live smoke on tracks known to be on Beatport; kill-switch config to
-disable the adapter.
-
-### P7 — library browser + playlist planning  [spec only — do not build yet]
-The end-state ambition. Sketch to pressure-test in a dedicated planning
-session before any build:
-- Browser: search/filter/sort over `tracks` (the GUI analog of views).
+### P3 — library browser + playlists + rekordbox export  [Opus: multi-surface]
+The phase the revision exists for. Depends on P2.
+- `content_hash` computed **in place** — hash every tracked file, backfill the
+  column, no file moves. It is rille's join key (P4) and it makes duplicate
+  detection a plain SQL query: same `recording_mbid`, different `content_hash`
+  = the same track owned twice (320 vs FLAC vs old rip). Surface duplicates in
+  the browser as a filter.
+- Screen 2: library browser — search/filter/sort over `tracks` along acquired
+  date, genre, key, label, artist, BPM. This is the slicing mechanism that
+  replaces views; multi-select feeds culling and playlist building.
 - Playlists: `playlists(id, name, created_at)` +
-  `playlist_tracks(playlist_id, track_id, position)` tables.
-- Planning aids: Camelot-wheel adjacency suggestions (±1 number, A↔B swap)
-  and a BPM window (±6%, configurable) — crater's canonical key format makes
-  this nearly free.
-- Export: `.m3u8` (paths into `store/`) and Rekordbox XML — the bridge that
-  makes planned playlists usable in actual DJ software.
-Dependencies: P2 app shell, P4 keys, ideally P3 store.
+  `playlist_tracks(playlist_id, track_id, position)`, drag-to-reorder.
+- Export: `.m3u8` (absolute paths to files where they currently live) and
+  rekordbox XML — `DJ_PLAYLISTS` with a `COLLECTION` of `TRACK` entries
+  (`Location` as `file://localhost/...` percent-encoded) plus a `PLAYLISTS`
+  node. XML is the supported import bridge; no writes to rekordbox's own DB.
+- Planning aids: Camelot adjacency suggestions (±1 number, A↔B swap) and a BPM
+  window (±6%, configurable), live once P4 lands keys.
+Verify: against a seeded DB, each browser filter's result set matches the
+equivalent SQL query row-for-row; exported XML validates against a known-good
+rekordbox export's structure and imports into rekordbox with playlist order
+intact; every path in an exported `.m3u8` resolves on disk; re-hashing an
+unmodified library is a no-op (zero rows updated).
 
-## Candidate features (discussed 2026-07-03 — unscheduled until user opts in)
+### P4 — rille key integration  [Sonnet: well-specified]
+Detection, benchmarking, and key review all live in rille. crater's side is a
+small read-only adapter, nothing more.
+- Open rille's SQLite DB read-only, select tracks whose key is
+  manually confirmed, join to `tracks` on `content_hash`, write `key` and
+  `key_source = 'manual'` through the normal diff/apply path so the import is
+  batched and revertible like any other tag change.
+- Unmatched hashes are reported, never guessed at — no fuzzy title matching.
+- crater keeps the canonical key format and its 24-spelling table (CLAUDE.md,
+  "Key format"): crater still stores and writes `Fm - 4A` form, and normalizes
+  whatever rille hands over into it.
+- rille's DB path is config (`[keys] rille_db`); missing DB is a clean skip,
+  not an error.
+Verify: fixture rille DB → confirmed keys land on the matching tracks with
+`key_source = 'manual'` and a `tag_history` batch; a row whose `content_hash`
+matches nothing is skipped and reported, writing zero rows; non-manual rille
+rows are never imported; all 24 canonical spellings round-trip.
 
-- **Energy/situation tagging** (1–5 energy; opener/peak/closer) — the P7
-  playlist-planning ambition has no energy data to plan with; energy arc
-  matters more than key compatibility for set flow. Cheapest capture: hotkeys
-  on the P4 review screen (the one OneTagger QuickTag idea worth
-  reimplementing). Wants its schema column decided before P4's migration.
-- **Duplicate/version detection** — same `recording_mbid`, different
-  `content_hash` = same track owned multiple times (320/FLAC/old rip). Nearly
-  free SQL on data lookup already produces; surface in `crater status` or the
-  browser.
-- **Watched staging folder** — watchdog on `staging/`, auto-ingest + lookup,
+## Candidate features (unscheduled until user opts in)
+
+- **Energy/situation tagging** (1–5 energy; opener/peak/closer) — playlist
+  planning has no energy data to plan with, and energy arc matters more than
+  key compatibility for set flow. Capture surface is now either the P3 browser
+  (inline edit while culling) or rille's review flow, where the user is already
+  listening end-to-end. Wants its schema column decided before P3's migration.
+- **Watched staging folder** — watchdog on a drop folder, auto-hash + lookup,
   notify when tracks await review. Turns crater into a pipeline rather than a
   chore.
-- **Library integrity doctor** — verify store hashes match filenames, orphaned
-  DB rows, broken symlinks. An fsck for a hash-addressed store; fits P3 or P5.
-- **Local BPM detection fallback** — librosa beat-track for tracks Deezer
-  doesn't know (edits, bootlegs); piggybacks on P4's analysis pass.
-- **Serato crate export** alongside Rekordbox XML at P7 (platform-agnostic
+- **Library integrity doctor** — verify stored hashes still match file
+  contents, find orphaned DB rows and missing files. Fits alongside P3's
+  hashing pass.
+- **Local BPM detection fallback** — for tracks Deezer doesn't know (edits,
+  bootlegs). rille already loads and analyzes the audio, so it is the cheaper
+  home for this than a second analysis pass in crater.
+- **Serato crate export** alongside rekordbox XML at P3 (platform-agnostic
   goal). Stretch: transition preview (key/BPM-matched A→B audition) — native
   AVAudioUnitTimePitch does this well, webview DSP poorly; a reason the Swift
   shell migration might eventually pay for itself.
 
 ## Parked / out of scope
 
+- **Views / symlink trees** — shelved indefinitely as of 2026-07-30. The P3
+  browser slices the library along the same axes without a derived tree to
+  rebuild, relink, or let drift. Revisit only if in-app browsing proves
+  insufficient, or if some other tool needs filesystem-shaped access.
+- **Store physical migration** — moving files into a content-hash-named
+  `store/` is deferred; P3 computes `content_hash` in place. **Wrinkle:** once
+  rekordbox holds file paths, moving files breaks every reference in it. So the
+  move has to happen either before rekordbox is deeply wired, or as a planned
+  one-time re-import. Decide before that debt compounds, not after.
+- **Beatport adapter** — optional and explicitly rot-owned. If ever built:
+  scraping contained in one adapter module behind the `MetadataSource`
+  protocol, degrading to "returns nothing" on markup shift (same contract as
+  lookup errors today), with a kill-switch config and a structure spike before
+  any commitment. Study OneTagger's beatport module for endpoint/field shape —
+  learn facts, don't copy code. Note the user finds Beatport's own keys
+  unreliable; rille's confirmed keys win regardless.
 - Distribution, notarization, App Store (personal tool; revisit licensing +
   packaging if this changes). Note: App Store specifically is effectively
   incompatible with a bundled-Python app; a native shell is a prerequisite.
