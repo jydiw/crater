@@ -17,6 +17,12 @@ class TrackRepo:
             "SELECT * FROM track WHERE id = ?", (track_id,)
         ).fetchone()
 
+    def get_by_ref(self, ref: str) -> sqlite3.Row | None:
+        """Resolve a user-facing track reference: all-digits = id, else a path."""
+        if ref.isdigit():
+            return self.get_by_id(int(ref))
+        return self.get_by_path(Path(ref).resolve())
+
     def insert(
         self,
         path: Path,
@@ -149,17 +155,21 @@ class ChangeRepo:
         )
 
     def get_by_track(
-        self, track_id: int, field: str | None = None
+        self,
+        track_id: int,
+        field: str | None = None,
+        batch_id: int | None = None,
     ) -> list[sqlite3.Row]:
+        sql = "SELECT * FROM change WHERE track_id = ?"
+        params: list[object] = [track_id]
         if field:
-            return self._conn.execute(
-                "SELECT * FROM change WHERE track_id = ? AND field = ? ORDER BY changed_at",
-                (track_id, field),
-            ).fetchall()
-        return self._conn.execute(
-            "SELECT * FROM change WHERE track_id = ? ORDER BY changed_at",
-            (track_id,),
-        ).fetchall()
+            sql += " AND field = ?"
+            params.append(field)
+        if batch_id is not None:
+            sql += " AND batch_id = ?"
+            params.append(batch_id)
+        # id breaks ties: changed_at is second-granularity, a batch lands within one
+        return self._conn.execute(f"{sql} ORDER BY changed_at, id", params).fetchall()  # noqa: S608
 
     def get_by_batch(self, batch_id: int) -> list[sqlite3.Row]:
         return self._conn.execute(

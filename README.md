@@ -9,9 +9,9 @@ and organizes files into a canonical store with symlink-based views.
 |--------|--------|
 | `tags diff` | Working (registration + AcoustID/MusicBrainz lookup) |
 | `tags apply` | Working |
-| `tags revert` | Planned |
-| `tags history` | Planned |
-| `tags forget / prune` | Planned |
+| `tags revert` | Working |
+| `tags history` | Working |
+| `tags forget / prune` | Working |
 | `store` / `ingest` | Planned |
 | `keys` | Planned |
 | `views` | Planned |
@@ -145,6 +145,68 @@ crater tags apply review.csv --force
 **Drift detection:** if a file's tag value changed on disk between `diff` and
 `apply`, that field is skipped and reported. Re-run `diff` to get fresh values,
 or use `--force` to write anyway.
+
+### `crater tags revert`
+
+Undoes one `apply` batch as a unit — every field it wrote goes back to its
+earlier value, in the file tags and the DB. The revert is recorded as a batch
+of its own, pointing at the batch it undid.
+
+```bash
+# Preview (including drift warnings)
+crater tags revert 3 --dry-run
+
+# Revert
+crater tags revert 3
+
+# Revert fields whose file value moved on since the apply
+crater tags revert 3 --force
+```
+
+**Exit codes:** `0` success, `1` unknown batch, `2` partial (drift/missing files).
+
+**Drift detection:** a field is only reverted if the file still holds the value
+that batch wrote. Anything else is skipped and reported — use `--force` to
+restore it anyway. Tracks whose file is gone are skipped, never an error.
+
+### `crater tags history`
+
+Shows the change log for one track, given its id or its path.
+
+```bash
+crater tags history 12
+crater tags history ~/Music/DJ/store/track.flac
+
+# Filter
+crater tags history 12 --field title
+crater tags history 12 --batch 3
+
+# Machine-readable
+crater tags history 12 --format json
+```
+
+```
+when                 field   change                   source     batch
+2026-07-30 14:02:11  title   Xtal → Xtal (Remaster)   csv-apply  3
+2026-07-30 14:09:48  title   Xtal (Remaster) → Xtal   revert     4
+```
+
+### `crater tags forget` / `crater tags prune`
+
+Deletion is first-class: `forget` drops one track, `prune` sweeps every track
+whose file is gone. Both delete the DB row and its change history; batches and
+the files on disk are left alone.
+
+```bash
+# One track (id or path), prompts for confirmation
+crater tags forget 12
+crater tags forget 12 --yes
+
+# Sweep tracks whose file no longer exists
+crater tags prune --dry-run
+crater tags prune
+crater tags prune --yes
+```
 
 ---
 

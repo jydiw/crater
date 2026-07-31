@@ -73,6 +73,15 @@ class ApplyResult:
     errors: list[str] = field(default_factory=list)
 
 
+@dataclass
+class RevertResult:
+    batch_id: int
+    reverted: int = 0
+    skipped_drift: list[tuple[int, str]] = field(default_factory=list)
+    skipped_missing: list[int] = field(default_factory=list)
+    errors: list[str] = field(default_factory=list)
+
+
 @dataclass(frozen=True)
 class HistoryEntry:
     id: int

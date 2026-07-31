@@ -6,7 +6,19 @@ import click
 
 from crater import config as cfg_mod
 from crater.db.connection import open_db
-from crater.tags.api import apply_diff, generate_diff, read_diff_csv, write_diff_csv
+from crater.tags.api import (
+    apply_diff,
+    find_track,
+    forget_track,
+    format_history,
+    generate_diff,
+    list_missing,
+    prune_missing,
+    read_diff_csv,
+    revert_batch,
+    track_history,
+    write_diff_csv,
+)
 from crater.tags.errors import CraterError
 from crater.tags.lookup import LookupConfig, RealMbClient
 
@@ -225,3 +237,166 @@ def tags_apply(
 
     if result.skipped_drift or result.skipped_missing or result.errors:
         sys.exit(2)
+
+
+@tags.command("revert")
+@click.argument("batch_id", type=int)
+@click.option(
+    "--dry-run",
+    is_flag=True,
+    default=False,
+    help="Show what would be reverted without touching files or DB.",
+)
+@click.option(
+    "--force", is_flag=True, default=False, help="Revert even if drift is detected."
+)
+@click.pass_context
+def tags_revert(ctx: click.Context, batch_id: int, dry_run: bool, force: bool) -> None:
+    """Undo a previous apply batch.
+
+    Every field the batch wrote is restored to its earlier value, in both the
+    file tags and the DB. Fields whose file value has moved on since the apply
+    are skipped unless --force. The revert is recorded as its own batch.
+    """
+    db_path: Path = ctx.obj["db_path"]
+
+    conn = open_db(db_path)
+    try:
+        result = revert_batch(conn, batch_id, dry_run=dry_run, force=force)
+    except CraterError as exc:
+        click.echo(f"error: {exc}", err=True)
+        sys.exit(1)
+    finally:
+        conn.close()
+
+    if dry_run:
+        click.echo(f"dry run: {result.reverted} field change(s) would be reverted.")
+    else:
+        click.echo(
+            f"reverted {result.reverted} field change(s) in batch "
+            f"{result.batch_id} (undoes batch {batch_id})."
+        )
+
+    if result.skipped_drift:
+        click.echo(
+            f"  skipped {len(result.skipped_drift)} field(s) due to drift "
+            f"(file changed since the apply — use --force):",
+            err=True,
+        )
+        for track_id, field_name in result.skipped_drift:
+            click.echo(f"    track {track_id}: {field_name}", err=True)
+    if result.skipped_missing:
+        click.echo(
+            f"  skipped {len(result.skipped_missing)} track(s) — file not found:",
+            err=True,
+        )
+        for track_id in result.skipped_missing:
+            click.echo(f"    track {track_id}", err=True)
+    if result.errors:
+        for err in result.errors:
+            click.echo(f"  error: {err}", err=True)
+
+    if result.skipped_drift or result.skipped_missing or result.errors:
+        sys.exit(2)
+
+
+@tags.command("history")
+@click.argument("track")
+@click.option("--field", "field_name", default=None, help="Only this field.")
+@click.option("--batch", "batch_id", type=int, default=None, help="Only this batch.")
+@click.option(
+    "--format",
+    "fmt",
+    type=click.Choice(["table", "json"]),
+    default="table",
+    help="Output format.",
+)
+@click.pass_context
+def tags_history(
+    ctx: click.Context,
+    track: str,
+    field_name: str | None,
+    batch_id: int | None,
+    fmt: str,
+) -> None:
+    """Show the change log for one track (id or path)."""
+    db_path: Path = ctx.obj["db_path"]
+
+    conn = open_db(db_path)
+    try:
+        row = find_track(conn, track)
+        entries = track_history(conn, row["id"], field=field_name, batch_id=batch_id)
+    except CraterError as exc:
+        click.echo(f"error: {exc}", err=True)
+        sys.exit(1)
+    finally:
+        conn.close()
+
+    if not entries and fmt == "table":
+        click.echo(f"no changes recorded for track {row['id']}.")
+        return
+    click.echo(format_history(entries, fmt))
+
+
+@tags.command("forget")
+@click.argument("track")
+@click.option("--yes", is_flag=True, default=False, help="Skip confirmation prompt.")
+@click.pass_context
+def tags_forget(ctx: click.Context, track: str, yes: bool) -> None:
+    """Delete one track (id or path) from the DB.
+
+    Its change history goes with it; batches and the file on disk survive.
+    """
+    db_path: Path = ctx.obj["db_path"]
+
+    conn = open_db(db_path)
+    try:
+        row = find_track(conn, track)
+        if not yes:
+            click.echo(f"  [{row['id']}] {row['path']}")
+            click.confirm("forget this track and its history?", abort=True)
+        forget_track(conn, row["id"])
+    except CraterError as exc:
+        click.echo(f"error: {exc}", err=True)
+        sys.exit(1)
+    finally:
+        conn.close()
+
+    click.echo(f"forgot track {row['id']}.")
+
+
+@tags.command("prune")
+@click.option(
+    "--dry-run",
+    is_flag=True,
+    default=False,
+    help="List tracks with missing files without deleting them.",
+)
+@click.option("--yes", is_flag=True, default=False, help="Skip confirmation prompt.")
+@click.pass_context
+def tags_prune(ctx: click.Context, dry_run: bool, yes: bool) -> None:
+    """Delete tracks whose file no longer exists."""
+    db_path: Path = ctx.obj["db_path"]
+
+    conn = open_db(db_path)
+    try:
+        missing = list_missing(conn)
+        if not missing:
+            click.echo("no tracks with missing files.")
+            return
+
+        for row in missing:
+            click.echo(f"  [{row['id']}] {row['path']}")
+
+        if dry_run:
+            click.echo(f"dry run: {len(missing)} track(s) would be forgotten.")
+            return
+
+        if not yes:
+            click.confirm(
+                f"forget {len(missing)} track(s) and their history?", abort=True
+            )
+        pruned = prune_missing(conn)
+        click.echo(f"forgot {len(pruned)} track(s).")
+    finally:
+        conn.close()

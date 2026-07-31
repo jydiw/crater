@@ -24,6 +24,7 @@ from crater.tags.io import read_tags
 from crater.tags.mb_filter import earliest_release, payload_to_tags, pick_release
 from crater.tags.models import TAGGABLE_FIELDS, Confidence, Decision, TrackDiff
 from crater.tags.ratelimit import RateLimiter
+from crater.tags.values import current_str
 
 ACOUSTID_RPS = 3.0
 MB_RPS = 1.0
@@ -103,10 +104,7 @@ class RealMbClient:
 
 def _current_str_dict(path: Path) -> dict[str, str | None]:
     tags = read_tags(path)
-    return {
-        f: (str(getattr(tags, f)) if getattr(tags, f) is not None else None)
-        for f in TAGGABLE_FIELDS
-    }
+    return {f: current_str(tags, f) for f in TAGGABLE_FIELDS}
 
 
 def _score_to_decision(score: float, cfg: LookupConfig) -> tuple[Decision, Confidence]:

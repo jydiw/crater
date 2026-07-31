@@ -8,40 +8,8 @@ from crater.db.repo import BatchRepo, ChangeRepo, TrackRepo
 from crater.tags.diff import read_diff_csv
 from crater.tags.errors import TagIOError
 from crater.tags.io import read_tags, write_tags
-from crater.tags.models import ApplyResult, TrackDiff, TrackTags
-
-_INT_FIELDS = {"release_year", "release_month", "release_day", "track_no"}
-_REAL_FIELDS = {"bpm"}
-
-
-def _to_db_value(field: str, str_val: str | None) -> object:
-    if str_val is None:
-        return None
-    if field in _INT_FIELDS:
-        try:
-            return int(str_val)
-        except ValueError:
-            return None
-    if field in _REAL_FIELDS:
-        try:
-            return float(str_val)
-        except ValueError:
-            return None
-    return str_val
-
-
-def _current_str(tags: TrackTags, field: str) -> str | None:
-    val = getattr(tags, field)
-    return str(val) if val is not None else None
-
-
-def _apply_changes_to_tags(
-    current: TrackTags, updates: dict[str, str | None]
-) -> TrackTags:
-    kwargs = {f: getattr(current, f) for f in current.__dataclass_fields__}
-    for f, new_val in updates.items():
-        kwargs[f] = _to_db_value(f, new_val)
-    return TrackTags(**kwargs)
+from crater.tags.models import ApplyResult, TrackDiff
+from crater.tags.values import apply_changes_to_tags, current_str, to_db_value
 
 
 def apply_diff(
@@ -99,7 +67,7 @@ def _apply_track(
     needs_file_write = False
 
     for field_name, before_val, after_val in changes:
-        current = _current_str(current_tags, field_name)
+        current = current_str(current_tags, field_name)
 
         if current == after_val:
             # File already has the target value; DB-only sync.
@@ -124,14 +92,14 @@ def _apply_track(
         return
 
     if needs_file_write:
-        updated_tags = _apply_changes_to_tags(current_tags, updates)
+        updated_tags = apply_changes_to_tags(current_tags, updates)
         try:
             write_tags(d.path, updated_tags)
         except TagIOError as exc:
             result.errors.append(f"{d.path}: file write failed: {exc}")
             return
 
-    db_updates: dict[str, object] = {f: _to_db_value(f, v) for f, v in updates.items()}
+    db_updates: dict[str, object] = {f: to_db_value(f, v) for f, v in updates.items()}
     repo = TrackRepo(conn)
     repo.update_tags(d.track_id, db_updates)
     repo.mark_reviewed(d.track_id, int(time.time()))

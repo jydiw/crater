@@ -20,6 +20,7 @@ from crater.db.repo import TrackRepo
 from crater.tags.io import detect_format, read_tags
 from crater.tags.lookup import LookupConfig, MbClient, lookup_track
 from crater.tags.models import TAGGABLE_FIELDS, TrackDiff, TrackTags
+from crater.tags.values import current_str
 
 _META_FIELDS: tuple[str, ...] = (
     "track_id",
@@ -32,14 +33,8 @@ _META_FIELDS: tuple[str, ...] = (
 _CSV_FIELDS: tuple[str, ...] = _META_FIELDS + TAGGABLE_FIELDS
 
 
-def _stringify(val: object) -> str | None:
-    if val is None:
-        return None
-    return str(val)
-
-
 def _tags_to_dict(tags: TrackTags) -> dict[str, str | None]:
-    return {f: _stringify(getattr(tags, f)) for f in TAGGABLE_FIELDS}
+    return {f: current_str(tags, f) for f in TAGGABLE_FIELDS}
 
 
 def _register_track(conn: sqlite3.Connection, path: Path) -> int:
