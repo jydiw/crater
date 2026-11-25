@@ -14,6 +14,7 @@ from crater.tags.models import TrackTags
 # Helpers
 # ---------------------------------------------------------------------------
 
+
 def _parse_date(s: str | None) -> tuple[int | None, int | None, int | None]:
     if not s:
         return None, None, None
@@ -47,6 +48,87 @@ def _parse_track_no(s: str | None) -> int | None:
         return None
 
 
+# Field -> (tag name crater writes, other names for the same field).
+# "date" stands for release_year/month/day together. Row order is write order.
+_TagTable = dict[str, tuple[str, tuple[str, ...]]]
+
+_ID3_NAMES: _TagTable = {
+    "title": ("TIT2", ()),
+    "artist": ("TPE1", ()),
+    "album": ("TALB", ()),
+    "track_no": ("TRCK", ()),
+    "genre": ("TCON", ()),
+    "label": ("TPUB", ()),
+    "key": ("TKEY", ()),
+    "date": ("TDRC", ()),
+    "bpm": ("TBPM", ()),
+    "recording_mbid": ("UFID:http://musicbrainz.org", ()),
+    "release_mbid": ("TXXX:MusicBrainz Album Id", ()),
+    "earliest_mbid": ("TXXX:MusicBrainz Earliest Id", ()),
+}
+
+_VORBIS_NAMES: _TagTable = {
+    "title": ("title", ()),
+    "artist": ("artist", ()),
+    "album": ("album", ()),
+    "track_no": ("tracknumber", ()),
+    "genre": ("genre", ()),
+    "label": ("organization", ()),
+    "key": ("initialkey", ()),
+    "date": ("date", ()),
+    "bpm": ("bpm", ()),
+    "recording_mbid": ("musicbrainz_trackid", ()),
+    "release_mbid": ("musicbrainz_albumid", ()),
+    "earliest_mbid": ("musicbrainz_earliestid", ()),
+}
+
+
+def _from_tag_values(values: dict[str, str | None]) -> TrackTags:
+    bpm_str = values["bpm"]
+    bpm: float | None = None
+    if bpm_str:
+        try:
+            bpm = float(bpm_str)
+        except ValueError:
+            pass
+
+    year, month, day = _parse_date(values["date"])
+
+    return TrackTags(
+        title=values["title"],
+        artist=values["artist"],
+        album=values["album"],
+        release_year=year,
+        release_month=month,
+        release_day=day,
+        track_no=_parse_track_no(values["track_no"]),
+        genre=values["genre"],
+        label=values["label"],
+        key=values["key"],
+        bpm=bpm,
+        recording_mbid=values["recording_mbid"],
+        release_mbid=values["release_mbid"],
+        earliest_mbid=values["earliest_mbid"],
+    )
+
+
+def _to_tag_values(tags: TrackTags) -> dict[str, str | None]:
+    return {
+        "title": tags.title,
+        "artist": tags.artist,
+        "album": tags.album,
+        "track_no": str(tags.track_no) if tags.track_no is not None else None,
+        "genre": tags.genre,
+        "label": tags.label,
+        "key": tags.key,
+        "date": _format_date(tags.release_year, tags.release_month, tags.release_day),
+        "bpm": str(int(tags.bpm)) if tags.bpm is not None else None,
+        "recording_mbid": tags.recording_mbid,
+        "release_mbid": tags.release_mbid,
+        "earliest_mbid": tags.earliest_mbid,
+    }
+
+
 def detect_format(path: Path) -> str:
     suffix = path.suffix.lower()
     if suffix == ".mp3":
@@ -59,6 +141,7 @@ def detect_format(path: Path) -> str:
 # ---------------------------------------------------------------------------
 # Reading
 # ---------------------------------------------------------------------------
+
 
 def read_tags(path: Path) -> TrackTags:
     fmt = detect_format(path)
@@ -90,56 +173,23 @@ def _read_mp3(path: Path) -> TrackTags:
     if tags is None:
         return TrackTags()
 
-    def text(frame_id: str) -> str | None:
-        frame = tags.get(frame_id)
+    def read(name: str) -> str | None:
+        frame = tags.get(name)
         if frame is None:
             return None
-        val = str(frame)
+        kind = name.partition(":")[0]
+        if kind == "UFID":
+            try:
+                val = frame.data.decode("utf-8")
+            except UnicodeDecodeError:
+                return None
+        elif kind == "TXXX":
+            val = frame.text[0] if frame.text else ""
+        else:
+            val = str(frame)
         return val.strip() or None
 
-    def txxx(desc: str) -> str | None:
-        frame = tags.get(f"TXXX:{desc}")
-        if frame is None:
-            return None
-        val = frame.text[0] if frame.text else ""
-        return val.strip() or None
-
-    def ufid(owner: str) -> str | None:
-        frame = tags.get(f"UFID:{owner}")
-        if frame is None:
-            return None
-        try:
-            return frame.data.decode("utf-8").strip() or None
-        except UnicodeDecodeError:
-            return None
-
-    bpm_str = text("TBPM")
-    bpm: float | None = None
-    if bpm_str:
-        try:
-            bpm = float(bpm_str)
-        except ValueError:
-            pass
-
-    year, month, day = _parse_date(text("TDRC"))
-    track_no = _parse_track_no(text("TRCK"))
-
-    return TrackTags(
-        title=text("TIT2"),
-        artist=text("TPE1"),
-        album=text("TALB"),
-        release_year=year,
-        release_month=month,
-        release_day=day,
-        track_no=track_no,
-        genre=text("TCON"),
-        label=text("TPUB"),
-        key=text("TKEY"),
-        bpm=bpm,
-        recording_mbid=ufid("http://musicbrainz.org"),
-        release_mbid=txxx("MusicBrainz Album Id"),
-        earliest_mbid=txxx("MusicBrainz Earliest Id"),
-    )
+    return _from_tag_values({f: read(name) for f, (name, _) in _ID3_NAMES.items()})
 
 
 def _read_flac(path: Path) -> TrackTags:
@@ -150,46 +200,21 @@ def _read_flac(path: Path) -> TrackTags:
 
     tags = audio.tags
 
-    def vorbis(key: str) -> str | None:
+    def read(name: str) -> str | None:
         if tags is None:
             return None
-        vals = tags.get(key.lower())
+        vals = tags.get(name)
         if not vals:
             return None
         return vals[0].strip() or None
 
-    bpm_str = vorbis("bpm")
-    bpm: float | None = None
-    if bpm_str:
-        try:
-            bpm = float(bpm_str)
-        except ValueError:
-            pass
-
-    year, month, day = _parse_date(vorbis("date"))
-    track_no = _parse_track_no(vorbis("tracknumber"))
-
-    return TrackTags(
-        title=vorbis("title"),
-        artist=vorbis("artist"),
-        album=vorbis("album"),
-        release_year=year,
-        release_month=month,
-        release_day=day,
-        track_no=track_no,
-        genre=vorbis("genre"),
-        label=vorbis("organization"),
-        key=vorbis("initialkey"),
-        bpm=bpm,
-        recording_mbid=vorbis("musicbrainz_trackid"),
-        release_mbid=vorbis("musicbrainz_albumid"),
-        earliest_mbid=vorbis("musicbrainz_earliestid"),
-    )
+    return _from_tag_values({f: read(name) for f, (name, _) in _VORBIS_NAMES.items()})
 
 
 # ---------------------------------------------------------------------------
 # Writing
 # ---------------------------------------------------------------------------
+
 
 def write_tags(path: Path, tags: TrackTags) -> None:
     fmt = detect_format(path)
@@ -210,49 +235,24 @@ def _write_mp3(path: Path, tags: TrackTags) -> None:
     id3 = audio.tags
     assert id3 is not None
 
-    def set_text(frame_cls: type, val: str | None) -> None:
-        frame_id = frame_cls.__name__
+    values = _to_tag_values(tags)
+    for f, (name, _) in _ID3_NAMES.items():
+        val = values[f]
         if val is not None:
-            id3[frame_id] = frame_cls(encoding=3, text=[val])
-        elif frame_id in id3:
-            del id3[frame_id]
-
-    set_text(mutagen.id3.TIT2, tags.title)
-    set_text(mutagen.id3.TPE1, tags.artist)
-    set_text(mutagen.id3.TALB, tags.album)
-    set_text(mutagen.id3.TRCK, str(tags.track_no) if tags.track_no is not None else None)
-    set_text(mutagen.id3.TCON, tags.genre)
-    set_text(mutagen.id3.TPUB, tags.label)
-    set_text(mutagen.id3.TKEY, tags.key)
-
-    date_str = _format_date(tags.release_year, tags.release_month, tags.release_day)
-    set_text(mutagen.id3.TDRC, date_str)
-
-    if tags.bpm is not None:
-        id3["TBPM"] = mutagen.id3.TBPM(encoding=3, text=[str(int(tags.bpm))])
-    elif "TBPM" in id3:
-        del id3["TBPM"]
-
-    # UFID for recording_mbid
-    ufid_owner = "http://musicbrainz.org"
-    if tags.recording_mbid is not None:
-        id3[f"UFID:{ufid_owner}"] = mutagen.id3.UFID(
-            owner=ufid_owner, data=tags.recording_mbid.encode("utf-8")
-        )
-    elif f"UFID:{ufid_owner}" in id3:
-        del id3[f"UFID:{ufid_owner}"]
-
-    def set_txxx(desc: str, val: str | None) -> None:
-        key = f"TXXX:{desc}"
-        if val is not None:
-            id3[key] = mutagen.id3.TXXX(encoding=3, desc=desc, text=[val])
-        elif key in id3:
-            del id3[key]
-
-    set_txxx("MusicBrainz Album Id", tags.release_mbid)
-    set_txxx("MusicBrainz Earliest Id", tags.earliest_mbid)
+            id3[name] = _id3_frame(name, val)
+        elif name in id3:
+            del id3[name]
 
     audio.save()
+
+
+def _id3_frame(name: str, val: str) -> mutagen.id3.Frame:
+    kind, _, desc = name.partition(":")
+    if kind == "UFID":
+        return mutagen.id3.UFID(owner=desc, data=val.encode("utf-8"))
+    if kind == "TXXX":
+        return mutagen.id3.TXXX(encoding=3, desc=desc, text=[val])
+    return mutagen.id3.Frames[kind](encoding=3, text=[val])
 
 
 def _write_flac(path: Path, tags: TrackTags) -> None:
@@ -266,23 +266,12 @@ def _write_flac(path: Path, tags: TrackTags) -> None:
     vc = audio.tags
     assert vc is not None
 
-    def set_vorbis(key: str, val: str | None) -> None:
+    values = _to_tag_values(tags)
+    for f, (name, _) in _VORBIS_NAMES.items():
+        val = values[f]
         if val is not None:
-            vc[key] = [val]
-        elif key in vc:
-            del vc[key]
-
-    set_vorbis("title", tags.title)
-    set_vorbis("artist", tags.artist)
-    set_vorbis("album", tags.album)
-    set_vorbis("tracknumber", str(tags.track_no) if tags.track_no is not None else None)
-    set_vorbis("genre", tags.genre)
-    set_vorbis("organization", tags.label)
-    set_vorbis("initialkey", tags.key)
-    set_vorbis("date", _format_date(tags.release_year, tags.release_month, tags.release_day))
-    set_vorbis("bpm", str(int(tags.bpm)) if tags.bpm is not None else None)
-    set_vorbis("musicbrainz_trackid", tags.recording_mbid)
-    set_vorbis("musicbrainz_albumid", tags.release_mbid)
-    set_vorbis("musicbrainz_earliestid", tags.earliest_mbid)
+            vc[name] = [val]
+        elif name in vc:
+            del vc[name]
 
     audio.save()
