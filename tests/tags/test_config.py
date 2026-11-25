@@ -46,6 +46,22 @@ class TestAcoustidKey:
         assert cfg_mod.tags_acoustid_key(cfg_mod.load()) == "from-env"
 
 
+class TestRemovedReleasePreference:
+    def test_the_scaffolded_config_has_no_release_preference(self, xdg: Path) -> None:
+        cfg_mod.load()
+        template = (xdg / "crater" / "config.toml").read_text()
+        assert "prefer" not in template
+        assert "acquired" not in template
+
+    def test_a_leftover_prefer_is_ignored(self, xdg: Path) -> None:
+        _write_config(
+            xdg, '[tags]\nprefer = "acquired"\nacoustid_skip_threshold = 0.8\n'
+        )
+        cfg = cfg_mod.load()
+        assert cfg_mod.tags_acoustid_skip(cfg) == 0.8
+        assert cfg_mod.tags_sources(cfg) == {}
+
+
 class TestTagsSources:
     def test_absent_table_is_empty(self, xdg: Path) -> None:
         assert cfg_mod.tags_sources(cfg_mod.load()) == {}

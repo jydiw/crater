@@ -42,6 +42,7 @@ def _file_title(path: Path) -> str:
 # revert
 # ---------------------------------------------------------------------------
 
+
 class TestCliRevert:
     def test_reverts_a_batch(
         self,
@@ -85,6 +86,7 @@ class TestCliRevert:
 # history
 # ---------------------------------------------------------------------------
 
+
 class TestCliHistory:
     def test_json_format(
         self,
@@ -108,9 +110,7 @@ class TestCliHistory:
     ) -> None:
         apply_change(title="MB Title", artist="MB Artist")
 
-        result = cli(
-            "tags", "history", str(flac_with_tags), "--field", "title"
-        )
+        result = cli("tags", "history", str(flac_with_tags), "--field", "title")
 
         assert result.exit_code == 0
         assert "Test Track → MB Title" in result.output
@@ -120,6 +120,7 @@ class TestCliHistory:
 # ---------------------------------------------------------------------------
 # forget
 # ---------------------------------------------------------------------------
+
 
 class TestCliForget:
     def test_yes_deletes_without_prompting(
@@ -149,6 +150,7 @@ class TestCliForget:
 # ---------------------------------------------------------------------------
 # prune
 # ---------------------------------------------------------------------------
+
 
 class TestCliPrune:
     def test_dry_run_deletes_nothing(
@@ -181,9 +183,7 @@ class TestCliPrune:
         assert "forgot 1 track(s)." in result.output
         assert TrackRepo(db).get_by_id(track_id) is None
 
-    def test_nothing_missing(
-        self, cli: Callable[..., Result], track_id: int
-    ) -> None:
+    def test_nothing_missing(self, cli: Callable[..., Result], track_id: int) -> None:
         result = cli("tags", "prune", "--yes")
 
         assert result.exit_code == 0
@@ -193,6 +193,7 @@ class TestCliPrune:
 # ---------------------------------------------------------------------------
 # diff — config warnings
 # ---------------------------------------------------------------------------
+
 
 class TestCliDiffSources:
     def test_unknown_source_and_field_are_warned_about(
@@ -208,3 +209,11 @@ class TestCliDiffSources:
         assert result.exit_code == 0
         assert "warning: unknown tag source 'beatport' (skipped)" in result.output
         assert "warning: unknown tag field 'mood' (skipped)" in result.output
+
+    def test_the_source_option_no_longer_exists(
+        self, cli: Callable[..., Result], track_id: int
+    ) -> None:
+        result = cli("tags", "diff", "--source", "acquired", "--track", str(track_id))
+
+        assert result.exit_code == 2
+        assert "No such option: --source" in result.output

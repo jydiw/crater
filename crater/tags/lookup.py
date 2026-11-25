@@ -8,9 +8,11 @@ Flow per track:
      candidate that clears the `match` guards.
   4. Else, when an AcoustID key is configured, fingerprint with fpcalc, call
      AcoustID and pick the best match. Either way the score is persisted.
-  5. When identified: pull the recording from MB (cache-first), pick a release
-     per `prefer`, run `mb_filter.payload_to_tags`. When not: no MB tags, and
-     the enrichers and art sources carry the diff on their own.
+  5. When identified: pull the recording and every Release carrying it from
+     MB (cache-first), take the Earliest release, run `mb_filter.payload_to_tags`.
+     With no official Release only the Recording's fields are proposed and the
+     notes say so. When not identified: no MB tags, and the enrichers and art
+     sources carry the diff on their own.
   6. Merge whatever was proposed over the file's values, build a TrackDiff.
   7. Decision/confidence are derived from the identity score bands; an
      unidentified track is always "review".
@@ -21,11 +23,17 @@ from __future__ import annotations
 import sqlite3
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
-from typing import Any, Literal, Protocol
+from typing import Any, Protocol
 
 from crater.db.repo import SourceCacheRepo, TrackRepo
 from crater.tags.art import ArtStager, read_art
-from crater.tags.enrich import MB_RPS, MbGenreFetcher, MbSource
+from crater.tags.enrich import (
+    MB_RPS,
+    Fetcher,
+    MbGenreFetcher,
+    MbSource,
+    get_json,
+)
 from crater.tags.errors import MBLookupError
 from crater.tags.io import read_duration, read_tags
 from crater.tags.match import duration_close, normalize, text_match_ok
@@ -33,7 +41,6 @@ from crater.tags.mb_filter import (
     artist_credit_join,
     earliest_release,
     payload_to_tags,
-    pick_release,
 )
 from crater.tags.merge import (
     DEFAULT_FIELD_SOURCES,
@@ -54,6 +61,14 @@ from crater.tags.values import current_str
 
 ACOUSTID_RPS = 3.0
 MB_SEARCH_LIMIT = 10
+MB_WS = "https://musicbrainz.org/ws/2"
+MB_BROWSE_LIMIT = 100  # the most MB returns per browse page
+# MB sheds load with 503s and expects clients to retry; the fetcher's rate
+# limiter already spaces attempts at least a second apart.
+MB_ATTEMPTS = 4
+# P1 cached the musicbrainzngs payload, which has no Release data, under
+# "mb-recording"; a new source name makes those entries miss.
+MB_RECORDING_CACHE = "mb-recording-releases"
 
 
 @dataclass
@@ -83,7 +98,6 @@ class MbClient(Protocol):
 
 @dataclass
 class LookupConfig:
-    prefer: Literal["earliest", "acquired"] = "earliest"
     preserve_if_set: tuple[str, ...] = ("bpm",)
     acoustid_skip: float = 0.90
     acoustid_high: float = 0.90
@@ -135,6 +149,7 @@ def _parse_search_entry(entry: dict[str, Any]) -> RecordingMatch | None:
 class RealMbClient:
     acoustid_key: str | None = None
     rate_limiter: RateLimiter = field(default_factory=RateLimiter)
+    fetch: Fetcher = get_json
 
     def search_recording(self, artist: str, title: str) -> list[RecordingMatch]:
         import musicbrainzngs
@@ -176,19 +191,42 @@ class RealMbClient:
         return matches
 
     def get_recording(self, recording_mbid: str) -> dict[str, Any]:
-        import musicbrainzngs
+        """The Recording plus every Release that carries it, in MB's JSON shape.
 
-        _set_useragent()
-        self.rate_limiter.acquire("musicbrainz", MB_RPS)
-        try:
-            # "release-groups" is not a valid include for a recording lookup
-            response = musicbrainzngs.get_recording_by_id(
-                recording_mbid,
-                includes=["artists", "releases"],
+        A recording lookup cannot include labels or release groups, so the
+        Releases come from a paged browse. Both requests take the plain JSON path
+        genres use, so the payload has one shape: MB's JSON, not musicbrainzngs's.
+        """
+        recording = self._get(
+            f"{MB_WS}/recording/{recording_mbid}?inc=artists&fmt=json"
+        )
+        releases: list[Any] = []
+        while True:
+            page = self._get(
+                f"{MB_WS}/release?recording={recording_mbid}"
+                f"&inc=labels+media+release-groups&limit={MB_BROWSE_LIMIT}"
+                f"&offset={len(releases)}&fmt=json"
             )
-        except musicbrainzngs.MusicBrainzError as e:
-            raise MBLookupError(f"MusicBrainz API error: {e}") from e
-        return response["recording"]
+            batch = page.get("releases")
+            if not isinstance(batch, list):
+                raise MBLookupError("MusicBrainz release browse: no release list")
+            releases.extend(batch)
+            # Without a count, only an empty page proves the list is complete.
+            count = page.get("release-count")
+            if not batch or (count is not None and len(releases) >= count):
+                break
+        return {**recording, "releases": releases}
+
+    def _get(self, url: str) -> dict[str, Any]:
+        for _ in range(MB_ATTEMPTS):
+            payload = self.fetch(
+                url, limiter=self.rate_limiter, bucket="musicbrainz", rps=MB_RPS
+            )
+            if isinstance(payload, dict):
+                return payload
+        raise MBLookupError(
+            f"MusicBrainz request failed after {MB_ATTEMPTS} attempts: {url}"
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -330,7 +368,7 @@ def lookup_track(
     art_stager: ArtStager | None = None,
 ) -> TrackDiff | None:
     """Look up MB tags for one track. Returns a TrackDiff or None when skipped
-    (already reviewed, file gone, no usable release, no changes proposed).
+    (already reviewed, file gone, nothing to change or report).
 
     `enrichers` are extra sources (Deezer, iTunes) merged per
     `lookup_cfg.field_sources`; without them the diff is MB-only.
@@ -349,28 +387,20 @@ def lookup_track(
     # mostly extended mixes, which MB largely doesn't catalog, but Deezer,
     # iTunes and the art sources search on the file's own artist/title.
     mb_tags: dict[str, str | None] = {}
-    release_mbid: str | None = None
+    release: dict[str, Any] | None = None
     if identity is not None:
         cache = SourceCacheRepo(conn)
-        payload = cache.get("mb-recording", identity.recording_mbid)
+        payload = cache.get(MB_RECORDING_CACHE, identity.recording_mbid)
         if payload is None:
             try:
                 payload = client.get_recording(identity.recording_mbid)
             except MBLookupError:
                 return None
-            cache.put("mb-recording", identity.recording_mbid, payload)
+            cache.put(MB_RECORDING_CACHE, identity.recording_mbid, payload)
         assert isinstance(payload, dict)  # the cache is shared with list-shaped sources
 
-        earliest = earliest_release(payload)
-        earliest_mbid = earliest.get("id") if earliest else None
-        release = pick_release(
-            payload,
-            prefer=lookup_cfg.prefer,
-            acquired_mbid=track_row["release_mbid"],
-        )
-        if release is None:
-            return None
-        release_mbid = release.get("id")
+        release = earliest_release(payload)
+        earliest_mbid = release.get("id") if release else None
         mb_tags = payload_to_tags(payload, release, earliest_mbid=earliest_mbid)
 
     before = _current_str_dict(path)
@@ -379,12 +409,15 @@ def lookup_track(
         before=before,
         duration_s=read_duration(path),
         recording_mbid=identity.recording_mbid if identity is not None else None,
-        release_mbid=release_mbid,
+        release_mbid=release.get("id") if release else None,
     )
     if identity is None:
         ctx.notes.append("identity: none")
     elif identity.via != "stored":
         ctx.notes.append(f"identity: {identity.via} {identity.score:.2f}")
+    no_release = identity is not None and release is None
+    if no_release:
+        ctx.notes.append("release: no official release")
     sources: dict[str, MetadataSource] = {
         "musicbrainz": MbSource(StaticSource("musicbrainz", mb_tags), mb_genre_fetcher),
         **(enrichers or {}),
@@ -398,8 +431,9 @@ def lookup_track(
 
     art = _propose_art(ctx, art_stager, lookup_cfg)
 
-    # Art alone is a diff worth reviewing, even when every text field agrees.
-    if before == merged.after and art is None:
+    # Art alone is a diff worth reviewing, even when every text field agrees;
+    # so is a missing official Release, which the user has to pin by hand.
+    if before == merged.after and art is None and not no_release:
         return None
 
     decision, confidence = (

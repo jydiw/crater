@@ -1,16 +1,20 @@
 """Pure functions that extract canonical tag values from a MusicBrainz recording
 payload. No network, no DB — easy to test against hand-crafted JSON fixtures.
 
-The "payload" passed around here is the `recording` dict returned by
-`musicbrainzngs.get_recording_by_id(id, includes=["artists", "releases",
-"release-groups"])` — i.e., the value of `response["recording"]`.
+The "payload" passed around here is what `RealMbClient.get_recording` returns:
+MusicBrainz's JSON recording lookup (`inc=artists`) with a "releases" key
+holding every Release that carries the Recording, browsed page by page with
+`inc=labels+media+release-groups` (date, country, status, release group with
+its primary and secondary types, medium formats, label names and Catalog
+numbers).
 """
 
 from __future__ import annotations
 
-from typing import Literal
-
 _LATE_SENTINEL = (9999, 99, 99)
+
+_PROPER_TYPES = frozenset({"Single", "EP", "Album"})
+_SIDELINED_SECONDARY_TYPES = frozenset({"Compilation", "DJ-mix"})
 
 
 def parse_partial_date(
@@ -29,11 +33,22 @@ def parse_partial_date(
     return (year, month, day)
 
 
-def _release_sort_key(release: dict) -> tuple[int, int, int]:
-    y, m, d = parse_partial_date(release.get("date"))
+def _date_sort_key(date_str: str | None) -> tuple[int, int, int]:
+    y, m, d = parse_partial_date(date_str)
     if y is None:
         return _LATE_SENTINEL
-    return (y, m or 0, d or 0)
+    # A vaguer date must not win by accident: "2009" sorts after "2009-12-31".
+    return (y, m or 99, d or 99)
+
+
+def _release_sort_key(release: dict) -> tuple[tuple[int, int, int], bool, str]:
+    """Earliest date, then a Release with a Catalog number, then ID, so the same
+    input always gives the same pick."""
+    return (
+        _date_sort_key(release.get("date")),
+        not _has_catalog_number(release),
+        release.get("id") or "",
+    )
 
 
 def artist_credit_join(credit: list) -> str:
@@ -51,48 +66,62 @@ def artist_credit_join(credit: list) -> str:
     return "".join(parts)
 
 
+def _label_info(release: dict) -> list[dict]:
+    return release.get("label-info") or []
+
+
+def _catalog_number(label_info: dict) -> str | None:
+    catno = label_info.get("catalog-number")
+    # MusicBrainz's own placeholder for "this Release has no Catalog number"
+    if not catno or catno == "[none]":
+        return None
+    return catno
+
+
+def _has_catalog_number(release: dict) -> bool:
+    return any(_catalog_number(li) for li in _label_info(release))
+
+
 def _releases(payload: dict) -> list[dict]:
-    return payload.get("release-list") or payload.get("releases") or []
+    return payload.get("releases") or []
+
+
+def _is_single_ep_or_album(release: dict) -> bool:
+    group = release.get("release-group") or {}
+    secondary = set(group.get("secondary-types") or [])
+    return (
+        group.get("primary-type") in _PROPER_TYPES
+        and not secondary & _SIDELINED_SECONDARY_TYPES
+    )
 
 
 def earliest_release(payload: dict) -> dict | None:
-    rels = _releases(payload)
-    if not rels:
+    """The Earliest release, as CONTEXT.md defines it; None when no Release
+    carrying the Recording is official."""
+    official = [r for r in _releases(payload) if r.get("status") == "Official"]
+    pool = [r for r in official if _is_single_ep_or_album(r)] or official
+    if not pool:
         return None
-    return min(rels, key=_release_sort_key)
+    return min(pool, key=_release_sort_key)
 
 
-def pick_release(
-    payload: dict,
-    *,
-    prefer: Literal["earliest", "acquired"],
-    acquired_mbid: str | None = None,
-) -> dict | None:
-    """Pick which release drives tag values. Falls back to earliest when
-    `prefer="acquired"` but the acquired MBID isn't in the release list."""
-    rels = _releases(payload)
-    if not rels:
-        return None
-    if prefer == "acquired" and acquired_mbid:
-        for r in rels:
-            if r.get("id") == acquired_mbid:
-                return r
-    return earliest_release(payload)
+def _label_name(label_info: dict) -> str | None:
+    return (label_info.get("label") or {}).get("name") or None
 
 
 def _label(release: dict) -> str | None:
-    labels = release.get("label-info-list") or release.get("label-info") or []
-    for li in labels:
-        label = li.get("label") or {}
-        name = label.get("name")
-        if name:
-            return name
-    return None
+    """The first label entry that has both a name and a Catalog number, so the
+    label matches the number printed with it; otherwise the first name."""
+    named = [li for li in _label_info(release) if _label_name(li)]
+    for li in named:
+        if _catalog_number(li):
+            return _label_name(li)
+    return _label_name(named[0]) if named else None
 
 
 def payload_to_tags(
     payload: dict,
-    release: dict,
+    release: dict | None,
     *,
     earliest_mbid: str | None = None,
 ) -> dict[str, str | None]:
@@ -100,7 +129,9 @@ def payload_to_tags(
 
     Only returns fields we can confidently derive from MB. Track number, genre,
     key, and bpm are never proposed here — the file's existing values win.
+    Without a release only the Recording's own fields are proposed.
     """
+    release = release or {}
     y, m, d = parse_partial_date(release.get("date"))
     artist = artist_credit_join(payload.get("artist-credit") or [])
     return {

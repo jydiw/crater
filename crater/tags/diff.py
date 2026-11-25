@@ -115,7 +115,8 @@ def generate_diff(
             else:
                 n = len(diff.changed_fields())
                 progress(f"[{i}/{total}] {label} … {n} change(s)")
-        if diff is not None and (diff.changed_fields() or diff.art):
+        # lookup_track already drops a Track with nothing to report.
+        if diff is not None:
             diffs.append(diff)
     return diffs
 

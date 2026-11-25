@@ -6,14 +6,18 @@ from pathlib import Path
 
 import pytest
 
-from crater.db.repo import TrackRepo
-from crater.tags.api import generate_diff, read_diff_csv, write_diff_csv
+from crater.db.repo import ChangeRepo, TrackRepo
+from crater.tags.api import apply_diff, generate_diff, read_diff_csv, write_diff_csv
+from crater.tags.lookup import AcoustIdMatch
 from crater.tags.models import TAGGABLE_FIELDS, ArtChange, TrackDiff
+from tests.conftest import _write_silent_flac
+from tests.tags.test_lookup import StubClient
 
 
 # ---------------------------------------------------------------------------
 # Registration (the side-effect of generate_diff)
 # ---------------------------------------------------------------------------
+
 
 class TestRegistration:
     def test_new_track_inserted_into_db(
@@ -51,9 +55,7 @@ class TestRegistration:
         assert row is not None
         assert row["title"] == "Manually Set"
 
-    def test_missing_file_skipped(
-        self, db: sqlite3.Connection, tmp_path: Path
-    ) -> None:
+    def test_missing_file_skipped(self, db: sqlite3.Connection, tmp_path: Path) -> None:
         ghost = tmp_path / "ghost.flac"
         generate_diff(db, [ghost])
         assert TrackRepo(db).list_all() == []
@@ -69,6 +71,7 @@ class TestRegistration:
 # ---------------------------------------------------------------------------
 # CSV write/read round-trip (independent of generate_diff)
 # ---------------------------------------------------------------------------
+
 
 def _make_diff(track_id: int, path: Path, **after_overrides: str | None) -> TrackDiff:
     """Build a TrackDiff simulating an MB proposal."""
@@ -136,8 +139,18 @@ class TestCsvRoundtrip:
         with out.open(newline="") as f:
             headers = csv.DictReader(f).fieldnames
         assert headers is not None
-        for col in ("track_id", "path", "row_kind", "decision", "confidence",
-                    "notes", "title", "artist", "bpm", "recording_mbid"):
+        for col in (
+            "track_id",
+            "path",
+            "row_kind",
+            "decision",
+            "confidence",
+            "notes",
+            "title",
+            "artist",
+            "bpm",
+            "recording_mbid",
+        ):
             assert col in headers
 
     def test_before_values_preserved_on_read(
@@ -148,9 +161,12 @@ class TestCsvRoundtrip:
         after = dict(before)
         after["title"] = "New Title"
         diff = TrackDiff(
-            track_id=1, path=flac_with_tags,
-            decision="accept", confidence="high",
-            before=before, after=after,
+            track_id=1,
+            path=flac_with_tags,
+            decision="accept",
+            confidence="high",
+            before=before,
+            after=after,
         )
         out = tmp_path / "diff.csv"
         write_diff_csv([diff], out)
@@ -235,6 +251,7 @@ class TestCsvRoundtrip:
 # Album art column
 # ---------------------------------------------------------------------------
 
+
 class TestCsvArt:
     def _art_only(self, path: Path, staged: Path, *, had_art: bool) -> TrackDiff:
         diff = _make_diff(1, path)
@@ -297,3 +314,44 @@ class TestCsvArt:
 
         loaded = read_diff_csv(out)
         assert loaded[0].art is None
+
+
+# ---------------------------------------------------------------------------
+# A Track with no official Release and nothing to change
+# ---------------------------------------------------------------------------
+
+
+class TestNoOfficialReleaseRow:
+    def test_the_row_round_trips_and_applying_it_changes_nothing(
+        self, db: sqlite3.Connection, tmp_path: Path
+    ) -> None:
+        path = _write_silent_flac(
+            tmp_path / "already.flac",
+            tags={
+                "title": "Test Track",
+                "artist": "Test Artist",
+                "musicbrainz_trackid": "rec-abc",
+            },
+        )
+        promo = {"id": "rel-promo", "title": "Promo", "status": "Promotion"}
+        client = StubClient(
+            matches=[AcoustIdMatch(0.95, "rec-abc")],
+            recording={
+                "id": "rec-abc",
+                "title": "Test Track",
+                "artist-credit": [{"name": "Test Artist"}],
+                "releases": [promo],
+            },
+        )
+        out = tmp_path / "diff.csv"
+        write_diff_csv(generate_diff(db, [path], client=client), out)
+        file_bytes = path.read_bytes()
+
+        [loaded] = read_diff_csv(out)
+        result = apply_diff(db, out)
+
+        assert "release: no official release" in loaded.notes
+        assert loaded.changed_fields() == []
+        assert result.errors == []
+        assert path.read_bytes() == file_bytes
+        assert ChangeRepo(db).get_by_track(loaded.track_id) == []

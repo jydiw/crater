@@ -10,16 +10,20 @@ from typing import Any
 import pytest
 
 from crater.db.repo import SourceCacheRepo, TrackRepo
+from crater.tags.api import generate_diff
 from crater.tags.art import ArtBlob, StagedArt, embed_art
 from crater.tags.diff import _register_track
 from crater.tags.lookup import (
     AcoustIdMatch,
     LookupConfig,
+    RealMbClient,
     RecordingMatch,
     lookup_track,
 )
 from crater.tags.merge import TrackContext
 from crater.tags.models import TAGGABLE_FIELDS, ArtChange
+from tests.conftest import _write_silent_flac
+from tests.tags.test_enrich import FakeFetch
 
 STAGED_PNG = b"\x89PNG\r\n\x1a\n" + b"staged" * 4
 EXISTING_JPEG = b"\xff\xd8\xff" + b"existing" * 4
@@ -81,23 +85,48 @@ def _search_match(
     )
 
 
+def _release(
+    id_: str,
+    title: str,
+    date: str | None,
+    *,
+    status: str | None = "Official",
+    primary: str = "Single",
+    secondary: tuple[str, ...] = (),
+    label: str | None = None,
+    catno: str | None = None,
+) -> dict:
+    """One Release in the shape MusicBrainz's JSON release browse returns."""
+    release: dict = {
+        "id": id_,
+        "title": title,
+        "date": date,
+        "country": "GB",
+        "release-group": {
+            "id": f"rg-{id_}",
+            "primary-type": primary,
+            "secondary-types": list(secondary),
+        },
+        "media": [{"format": "CD"}],
+        "label-info": (
+            [{"catalog-number": catno, "label": {"name": label}}] if label else []
+        ),
+    }
+    if status is not None:
+        release["status"] = status
+    return release
+
+
 def _default_recording() -> dict:
     return {
         "id": "rec-abc",
         "title": "MB Title",
         "artist-credit": [{"name": "MB Artist"}],
-        "release-list": [
-            {
-                "id": "rel-early",
-                "title": "MB Album",
-                "date": "1990-01-01",
-                "label-info-list": [{"label": {"name": "MB Label"}}],
-            },
-            {
-                "id": "rel-late",
-                "title": "Reissue",
-                "date": "2010-06-15",
-            },
+        "releases": [
+            _release(
+                "rel-early", "MB Album", "1990-01-01", label="MB Label", catno="MB-1"
+            ),
+            _release("rel-late", "Reissue", "2010-06-15", primary="Album"),
         ],
     }
 
@@ -247,7 +276,9 @@ class TestTextSearch:
         assert client.search_calls == 1
         assert second is not None
         assert "identity: mb-search" in second.notes  # cached matches still resolve
-        assert SourceCacheRepo(db).get("mb-search", "test artist|test track") is not None
+        assert (
+            SourceCacheRepo(db).get("mb-search", "test artist|test track") is not None
+        )
 
     def test_search_error_skips_the_track(
         self, db: sqlite3.Connection, flac_with_tags: Path
@@ -275,7 +306,9 @@ class TestMbCache:
         row = _register(db, flac_with_tags)
         TrackRepo(db).update_tags(row["id"], {"recording_mbid": "rec-abc"})
         TrackRepo(db).set_mb_confidence(row["id"], 0.95)
-        SourceCacheRepo(db).put("mb-recording", "rec-abc", _default_recording())
+        SourceCacheRepo(db).put(
+            "mb-recording-releases", "rec-abc", _default_recording()
+        )
         row = TrackRepo(db).get_by_id(row["id"])
 
         client = StubClient()
@@ -288,7 +321,8 @@ class TestMbCache:
         row = _register(db, flac_with_tags)
         client = StubClient(matches=[AcoustIdMatch(0.95, "rec-abc")])
         lookup_track(db, client, row, lookup_cfg=_cfg())
-        assert SourceCacheRepo(db).get("mb-recording", "rec-abc") is not None
+        cached = SourceCacheRepo(db).get("mb-recording-releases", "rec-abc")
+        assert cached is not None
 
 
 # ---------------------------------------------------------------------------
@@ -384,25 +418,12 @@ class TestFailureModes:
 
 
 # ---------------------------------------------------------------------------
-# prefer="acquired"
+# The release ID already in the file
 # ---------------------------------------------------------------------------
 
 
-class TestPreferAcquired:
-    def test_uses_acquired_release_when_mbid_set(
-        self, db: sqlite3.Connection, flac_with_tags: Path
-    ) -> None:
-        row = _register(db, flac_with_tags)
-        TrackRepo(db).update_tags(row["id"], {"release_mbid": "rel-late"})
-        row = TrackRepo(db).get_by_id(row["id"])
-
-        client = StubClient(matches=[AcoustIdMatch(0.95, "rec-abc")])
-        diff = lookup_track(db, client, row, lookup_cfg=_cfg(prefer="acquired"))
-        assert diff is not None
-        assert diff.after["release_mbid"] == "rel-late"
-        assert diff.after["earliest_mbid"] == "rel-early"
-
-    def test_default_prefers_earliest(
+class TestAcquiredReleaseIgnored:
+    def test_the_earliest_release_wins_over_the_file_release_id(
         self, db: sqlite3.Connection, flac_with_tags: Path
     ) -> None:
         row = _register(db, flac_with_tags)
@@ -413,6 +434,303 @@ class TestPreferAcquired:
         diff = lookup_track(db, client, row, lookup_cfg=_cfg())
         assert diff is not None
         assert diff.after["release_mbid"] == "rel-early"
+
+
+# ---------------------------------------------------------------------------
+# Earliest release, through the tags API
+# ---------------------------------------------------------------------------
+
+
+def _sky_falls_down(*releases: dict) -> dict:
+    return {
+        "id": "rec-abc",
+        "title": "Sky Falls Down (Armin van Buuren remix)",
+        "artist-credit": [{"name": "OceanLab"}],
+        "releases": list(releases),
+    }
+
+
+_SINGLE_2002 = _release(
+    "rel-single",
+    "Sky Falls Down",
+    "2002-10-14",
+    label="Anjunabeats",
+    catno="ANJCDS002",
+)
+_PROMO_2003 = _release(
+    "rel-promo",
+    "Sky Falls Down (promo)",
+    "2003",
+    status="Promotion",
+    label="Promo Pool",
+    catno="PROMO-1",
+)
+_ALBUM_2008 = _release(
+    "rel-album",
+    "Sirens of the Sea",
+    "2008-07-21",
+    primary="Album",
+    label="Anjunabeats",
+    catno="ANJCD011",
+)
+
+
+class TestEarliestReleaseInTheDiff:
+    def test_the_2002_single_supplies_album_date_and_label(
+        self, db: sqlite3.Connection, flac_with_tags: Path
+    ) -> None:
+        client = StubClient(
+            matches=[AcoustIdMatch(0.95, "rec-abc")],
+            recording=_sky_falls_down(_ALBUM_2008, _PROMO_2003, _SINGLE_2002),
+        )
+
+        [diff] = generate_diff(db, [flac_with_tags], client=client)
+
+        assert diff.after["album"] == "Sky Falls Down"
+        assert diff.after["release_year"] == "2002"
+        assert diff.after["release_month"] == "10"
+        assert diff.after["release_day"] == "14"
+        assert diff.after["label"] == "Anjunabeats"
+        assert diff.after["release_mbid"] == "rel-single"
+        assert diff.after["earliest_mbid"] == "rel-single"
+
+    def test_no_official_release_proposes_no_release_fields(
+        self, db: sqlite3.Connection, flac_with_tags: Path
+    ) -> None:
+        client = StubClient(
+            matches=[AcoustIdMatch(0.95, "rec-abc")],
+            recording=_sky_falls_down(_PROMO_2003),
+        )
+
+        [diff] = generate_diff(db, [flac_with_tags], client=client)
+
+        assert diff.after["title"] == "Sky Falls Down (Armin van Buuren remix)"
+        assert diff.after["album"] == "Test Album"
+        assert diff.after["release_year"] == "1996"
+        assert diff.after["release_month"] == "9"
+        assert diff.after["release_day"] == "23"
+        assert diff.after["label"] == "Test Label"
+        assert diff.after["release_mbid"] is None
+        assert diff.after["earliest_mbid"] is None
+        assert "release: no official release" in diff.notes
+
+    def test_no_official_release_is_reported_even_with_nothing_to_change(
+        self, tmp_path: Path, db: sqlite3.Connection
+    ) -> None:
+        path = _write_silent_flac(
+            tmp_path / "already.flac",
+            tags={
+                "title": "Test Track",
+                "artist": "Test Artist",
+                "musicbrainz_trackid": "rec-abc",
+            },
+        )
+        client = StubClient(
+            matches=[AcoustIdMatch(0.95, "rec-abc")],
+            recording=_already_tagged_recording(_PROMO_2003),
+        )
+
+        diffs = generate_diff(db, [path], client=client)
+
+        assert len(diffs) == 1
+        assert diffs[0].changed_fields() == []
+        assert "release: no official release" in diffs[0].notes
+
+    def test_an_identified_track_with_nothing_to_report_is_dropped(
+        self, tmp_path: Path, db: sqlite3.Connection
+    ) -> None:
+        path = _write_silent_flac(
+            tmp_path / "already.flac",
+            tags={
+                "title": "Test Track",
+                "artist": "Test Artist",
+                "album": "Test Album",
+                "date": "1996-09-23",
+                "organization": "Test Label",
+                "musicbrainz_trackid": "rec-abc",
+                "musicbrainz_albumid": "rel-test",
+                "musicbrainz_earliestid": "rel-test",
+            },
+        )
+        official = _release("rel-test", "Test Album", "1996-09-23", label="Test Label")
+        client = StubClient(
+            matches=[AcoustIdMatch(0.95, "rec-abc")],
+            recording=_already_tagged_recording(official),
+        )
+
+        assert generate_diff(db, [path], client=client) == []
+
+
+def _already_tagged_recording(*releases: dict) -> dict:
+    """The Recording whose title and artist the fixture FLAC already carries."""
+    return {
+        "id": "rec-abc",
+        "title": "Test Track",
+        "artist-credit": [{"name": "Test Artist"}],
+        "releases": list(releases),
+    }
+
+
+_RECORDING_URL = "https://musicbrainz.org/ws/2/recording/rec-abc?inc=artists&fmt=json"
+
+
+def _releases_url(offset: int) -> str:
+    return (
+        "https://musicbrainz.org/ws/2/release?recording=rec-abc"
+        f"&inc=labels+media+release-groups&limit=100&offset={offset}&fmt=json"
+    )
+
+
+def _two_page_payloads() -> dict[str, object]:
+    """101 Releases: a page of later album issues, then the 2002 single alone."""
+    albums = [
+        _release(f"rel-{i:03d}", "Sirens of the Sea", "2008-07-21", primary="Album")
+        for i in range(100)
+    ]
+    return {
+        _RECORDING_URL: _sky_falls_down(),
+        _releases_url(0): {
+            "release-count": 101,
+            "release-offset": 0,
+            "releases": albums,
+        },
+        _releases_url(100): {
+            "release-count": 101,
+            "release-offset": 100,
+            "releases": [_SINGLE_2002],
+        },
+    }
+
+
+def _register_with_stored_identity(db: sqlite3.Connection, path: Path) -> None:
+    """A confident recording ID already on the row, so no search request is made."""
+    generate_diff(db, [path])
+    row = TrackRepo(db).get_by_path(path.resolve())
+    assert row is not None
+    TrackRepo(db).update_tags(row["id"], {"recording_mbid": "rec-abc"})
+    TrackRepo(db).set_mb_confidence(row["id"], 0.95)
+
+
+class TestRealClientReleaseList:
+    def test_a_release_list_longer_than_one_page_is_fetched_completely(
+        self, db: sqlite3.Connection, flac_with_tags: Path
+    ) -> None:
+        _register_with_stored_identity(db, flac_with_tags)
+        client = RealMbClient(fetch=FakeFetch(_two_page_payloads()))
+
+        [diff] = generate_diff(db, [flac_with_tags], client=client)
+
+        assert diff.after["album"] == "Sky Falls Down"
+        assert diff.after["release_year"] == "2002"
+        assert diff.after["label"] == "Anjunabeats"
+
+    def test_pages_without_a_release_count_are_fetched_until_one_comes_back_empty(
+        self, db: sqlite3.Connection, flac_with_tags: Path
+    ) -> None:
+        _register_with_stored_identity(db, flac_with_tags)
+        payloads = _two_page_payloads()
+        for offset in (0, 100):
+            del payloads[_releases_url(offset)]["release-count"]  # type: ignore[attr-defined]
+        payloads[_releases_url(101)] = {"release-offset": 101, "releases": []}
+
+        [diff] = generate_diff(
+            db, [flac_with_tags], client=RealMbClient(fetch=FakeFetch(payloads))
+        )
+
+        assert diff.after["album"] == "Sky Falls Down"
+        assert diff.after["release_year"] == "2002"
+
+    def test_a_second_diff_of_the_same_file_makes_no_request(
+        self, db: sqlite3.Connection, flac_with_tags: Path
+    ) -> None:
+        _register_with_stored_identity(db, flac_with_tags)
+        fetch = FakeFetch(_two_page_payloads())
+        client = RealMbClient(fetch=fetch)
+
+        generate_diff(db, [flac_with_tags], client=client)
+        requests_after_first = list(fetch.urls)
+        [second] = generate_diff(db, [flac_with_tags], client=client)
+
+        assert requests_after_first == [
+            _RECORDING_URL,
+            _releases_url(0),
+            _releases_url(100),
+        ]
+        assert fetch.urls == requests_after_first
+        assert second.after["album"] == "Sky Falls Down"
+
+    def test_a_failed_page_is_not_cached_as_a_short_list(
+        self, db: sqlite3.Connection, flac_with_tags: Path
+    ) -> None:
+        _register_with_stored_identity(db, flac_with_tags)
+        payloads = _two_page_payloads()
+        last_page = payloads.pop(_releases_url(100))
+
+        failed = generate_diff(
+            db, [flac_with_tags], client=RealMbClient(fetch=FakeFetch(payloads))
+        )
+        payloads[_releases_url(100)] = last_page
+        [retried] = generate_diff(
+            db, [flac_with_tags], client=RealMbClient(fetch=FakeFetch(payloads))
+        )
+
+        assert failed == []
+        assert retried.after["album"] == "Sky Falls Down"
+
+    def test_a_recording_cached_before_release_data_is_fetched_again(
+        self, db: sqlite3.Connection, flac_with_tags: Path
+    ) -> None:
+        _register_with_stored_identity(db, flac_with_tags)
+        # What P1 cached: musicbrainzngs's shape, no status, no label data.
+        SourceCacheRepo(db).put(
+            "mb-recording",
+            "rec-abc",
+            {"id": "rec-abc", "title": "Old", "release-list": [{"id": "rel-x"}]},
+        )
+        fetch = FakeFetch(_two_page_payloads())
+
+        [diff] = generate_diff(db, [flac_with_tags], client=RealMbClient(fetch=fetch))
+
+        assert diff.after["album"] == "Sky Falls Down"
+        assert _RECORDING_URL in fetch.urls
+
+    def test_a_recording_lookup_that_fails_once_is_retried(
+        self, db: sqlite3.Connection, flac_with_tags: Path
+    ) -> None:
+        _register_with_stored_identity(db, flac_with_tags)
+        fetch = FakeFetch(_two_page_payloads(), failures={_RECORDING_URL: 1})
+
+        [diff] = generate_diff(db, [flac_with_tags], client=RealMbClient(fetch=fetch))
+
+        assert diff.after["album"] == "Sky Falls Down"
+
+    def test_a_release_page_that_fails_once_is_retried(
+        self, db: sqlite3.Connection, flac_with_tags: Path
+    ) -> None:
+        _register_with_stored_identity(db, flac_with_tags)
+        fetch = FakeFetch(_two_page_payloads(), failures={_releases_url(100): 1})
+
+        [diff] = generate_diff(db, [flac_with_tags], client=RealMbClient(fetch=fetch))
+
+        assert diff.after["album"] == "Sky Falls Down"
+        assert diff.after["release_year"] == "2002"
+
+    def test_a_request_that_never_answers_is_tried_four_times(
+        self, db: sqlite3.Connection, flac_with_tags: Path
+    ) -> None:
+        _register_with_stored_identity(db, flac_with_tags)
+        dead = FakeFetch(_two_page_payloads(), failures={_RECORDING_URL: 99})
+
+        failed = generate_diff(db, [flac_with_tags], client=RealMbClient(fetch=dead))
+        [retried] = generate_diff(
+            db,
+            [flac_with_tags],
+            client=RealMbClient(fetch=FakeFetch(_two_page_payloads())),
+        )
+
+        assert dead.urls == [_RECORDING_URL] * 4
+        assert failed == []
+        assert retried.after["album"] == "Sky Falls Down"
 
 
 # ---------------------------------------------------------------------------
@@ -742,14 +1060,19 @@ class TestUnidentified:
         assert (diff.decision, diff.confidence) == ("review", "medium")
         assert "identity: none" not in diff.notes
 
-    def test_identity_without_a_usable_release_is_a_skip(
+    def test_identity_without_any_release_says_so_in_the_notes(
         self, db: sqlite3.Connection, flac_with_tags: Path
     ) -> None:
         row = _register(db, flac_with_tags)
         client = StubClient(
             matches=[AcoustIdMatch(0.95, "rec-abc")],
-            recording={"id": "rec-abc", "title": "MB Title", "release-list": []},
+            recording={"id": "rec-abc", "title": "MB Title", "releases": []},
         )
 
-        assert lookup_track(db, client, row, lookup_cfg=_cfg()) is None
-        assert client.mb_calls == 1
+        diff = lookup_track(db, client, row, lookup_cfg=_cfg())
+
+        assert diff is not None
+        assert diff.after["title"] == "MB Title"
+        assert diff.after["album"] == "Test Album"
+        assert diff.after["release_mbid"] is None
+        assert "release: no official release" in diff.notes

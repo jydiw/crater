@@ -123,12 +123,6 @@ def tags() -> None:
     help="Restrict to track IDs (repeatable).",
 )
 @click.option(
-    "--source",
-    type=click.Choice(["earliest", "acquired"]),
-    default=None,
-    help="Which release to prefer for MB tags. Overrides config.",
-)
-@click.option(
     "--replace-art",
     is_flag=True,
     default=False,
@@ -140,7 +134,6 @@ def tags_diff(
     paths: tuple[Path, ...],
     out: Path | None,
     track_ids: tuple[int, ...],
-    source: str | None,
     replace_art: bool,
 ) -> None:
     """Register tracks and generate a MB tag diff CSV for review.
@@ -155,7 +148,6 @@ def tags_diff(
     db_path: Path = ctx.obj["db_path"]
     library_root: Path = ctx.obj["library_root"]
     crater_cfg: dict = ctx.obj["cfg"]
-    prefer = source or cfg_mod.tags_prefer(crater_cfg)
     preserve_if_set = cfg_mod.tags_preserve_if_set(crater_cfg)
 
     acoustid_key = cfg_mod.tags_acoustid_key(crater_cfg)
@@ -168,7 +160,6 @@ def tags_diff(
         click.echo(f"warning: unknown tag source '{name}' (skipped)", err=True)
 
     lookup_cfg = LookupConfig(
-        prefer=prefer,  # type: ignore[arg-type]
         preserve_if_set=tuple(preserve_if_set),
         acoustid_skip=cfg_mod.tags_acoustid_skip(crater_cfg),
         acoustid_high=cfg_mod.tags_acoustid_high(crater_cfg),

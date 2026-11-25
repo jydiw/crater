@@ -21,7 +21,6 @@ _CONFIG_TEMPLATE = """\
 # CRATER_LIBRARY_ROOT env var overrides this
 
 [tags]
-prefer = "earliest"                # "earliest" | "acquired"
 preserve_if_set = ["bpm"]          # never propose overwriting these if already tagged
 acoustid_skip_threshold = 0.90     # skip fingerprint when stored score ≥ this
 acoustid_high_threshold = 0.90     # score ≥ this → decision=accept, confidence=high
@@ -94,12 +93,6 @@ def tags_acoustid_key(cfg: dict[str, object]) -> str | None:
     assert isinstance(tags, dict)
     key = tags.get("acoustid_key")
     return str(key) if key else None
-
-
-def tags_prefer(cfg: dict[str, object]) -> str:
-    tags = cfg.get("tags", {})
-    assert isinstance(tags, dict)
-    return str(tags.get("prefer", "earliest"))
 
 
 def tags_preserve_if_set(cfg: dict[str, object]) -> list[str]:

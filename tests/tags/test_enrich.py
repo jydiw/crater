@@ -46,16 +46,25 @@ MB_GENRES = "https://musicbrainz.org/ws/2/recording/rec-abc?inc=genres&fmt=json"
 
 
 class FakeFetch:
-    """Canned payloads by URL + a call log. Unknown URL = a failed request."""
+    """Canned payloads by URL + a call log. Unknown URL = a failed request.
 
-    def __init__(self, payloads: dict[str, object]) -> None:
+    `failures` maps a URL to how many requests for it fail before it answers.
+    """
+
+    def __init__(
+        self, payloads: dict[str, object], failures: dict[str, int] | None = None
+    ) -> None:
         self.payloads = payloads
+        self.failures = dict(failures or {})
         self.calls: list[tuple[str, str, float]] = []
 
     def __call__(
         self, url: str, *, limiter: RateLimiter, bucket: str, rps: float
     ) -> object | None:
         self.calls.append((url, bucket, rps))
+        if self.failures.get(url, 0) > 0:
+            self.failures[url] -= 1
+            return None
         return self.payloads.get(url)
 
     @property
