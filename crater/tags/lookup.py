@@ -36,7 +36,12 @@ from crater.tags.enrich import (
 )
 from crater.tags.errors import MBLookupError
 from crater.tags.io import read_duration, read_tags
-from crater.tags.match import duration_close, normalize, text_match_ok
+from crater.tags.match import (
+    duration_close,
+    house_style_title,
+    normalize,
+    text_match_ok,
+)
 from crater.tags.mb_filter import (
     artist_credit_join,
     earliest_release,
@@ -404,6 +409,8 @@ def lookup_track(
         mb_tags = payload_to_tags(payload, release, earliest_mbid=earliest_mbid)
 
     before = _current_str_dict(path)
+    if mb_title := mb_tags.get("title"):
+        mb_tags["title"] = house_style_title(mb_title, before["title"])
     ctx = TrackContext(
         path=path,
         before=before,

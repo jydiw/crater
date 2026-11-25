@@ -504,7 +504,7 @@ class TestEarliestReleaseInTheDiff:
 
         [diff] = generate_diff(db, [flac_with_tags], client=client)
 
-        assert diff.after["title"] == "Sky Falls Down (Armin van Buuren remix)"
+        assert diff.after["title"] == "Sky Falls Down (Armin van Buuren Remix)"
         assert diff.after["album"] == "Test Album"
         assert diff.after["release_year"] == "1996"
         assert diff.after["release_month"] == "9"
@@ -559,6 +559,59 @@ class TestEarliestReleaseInTheDiff:
         )
 
         assert generate_diff(db, [path], client=client) == []
+
+
+class TestHouseStyleInTheDiff:
+    def test_the_mix_descriptor_is_capitalised(
+        self, db: sqlite3.Connection, flac_with_tags: Path
+    ) -> None:
+        client = StubClient(
+            matches=[AcoustIdMatch(0.95, "rec-abc")],
+            recording=_sky_falls_down(_SINGLE_2002),
+        )
+
+        [diff] = generate_diff(db, [flac_with_tags], client=client)
+
+        assert diff.after["title"] == "Sky Falls Down (Armin van Buuren Remix)"
+
+    def test_the_files_original_mix_is_kept(
+        self, tmp_path: Path, db: sqlite3.Connection
+    ) -> None:
+        path = _write_silent_flac(
+            tmp_path / "cola.flac",
+            tags={"title": "cola (original mix)", "artist": "CamelPhat"},
+        )
+        recording = {
+            "id": "rec-abc",
+            "title": "Cola",
+            "artist-credit": [{"name": "CamelPhat"}],
+            "releases": [_SINGLE_2002],
+        }
+        client = StubClient(
+            matches=[AcoustIdMatch(0.95, "rec-abc")], recording=recording
+        )
+
+        [diff] = generate_diff(db, [path], client=client)
+
+        assert diff.after["title"] == "Cola (Original Mix)"
+
+    def test_album_and_artist_are_not_house_styled(
+        self, db: sqlite3.Connection, flac_with_tags: Path
+    ) -> None:
+        recording = {
+            "id": "rec-abc",
+            "title": "Sky Falls Down",
+            "artist-credit": [{"name": "OceanLab (dub)"}],
+            "releases": [_release("rel-x", "Sky Falls Down (club mix)", "2002")],
+        }
+        client = StubClient(
+            matches=[AcoustIdMatch(0.95, "rec-abc")], recording=recording
+        )
+
+        [diff] = generate_diff(db, [flac_with_tags], client=client)
+
+        assert diff.after["album"] == "Sky Falls Down (club mix)"
+        assert diff.after["artist"] == "OceanLab (dub)"
 
 
 def _already_tagged_recording(*releases: dict) -> dict:

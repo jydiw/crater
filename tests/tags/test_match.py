@@ -7,6 +7,7 @@ import pytest
 from crater.tags.match import (
     artist_overlaps,
     duration_close,
+    house_style_title,
     normalize,
     strip_mix_suffix,
     text_match_ok,
@@ -146,3 +147,62 @@ class TestArtistOverlaps:
     )
     def test_artist_overlaps(self, a: str, b: str, expected: bool) -> None:
         assert artist_overlaps(a, b) is expected
+
+
+class TestHouseStyleTitle:
+    @pytest.mark.parametrize(
+        "source,current,expected",
+        [
+            (
+                "Sky Falls Down (Armin van Buuren remix)",
+                None,
+                "Sky Falls Down (Armin van Buuren Remix)",
+            ),
+            ("Sun & Moon (radio edit)", None, "Sun & Moon (Radio Edit)"),
+            ("Come Alive (extended mix)", None, "Come Alive (Extended Mix)"),
+            ("Come Alive [extended mix]", None, "Come Alive [Extended Mix]"),
+            ("Foo [radio edit]", None, "Foo [Radio Edit]"),
+            ("X (dub)", None, "X (Dub)"),
+            ("X (vocal version)", None, "X (Vocal Version)"),
+            ("X (instrumental)", None, "X (Instrumental)"),
+            ("X (Argy rework)", None, "X (Argy Rework)"),
+            ("X (Argy bootleg)", None, "X (Argy Bootleg)"),
+            ("X (original mix)", None, "X (Original Mix)"),
+            ("X (club mix)", None, "X (Club Mix)"),
+            ("X (REMIX)", None, "X (REMIX)"),
+            ("X (rEMIX)", None, "X (REMIX)"),
+            ("club life", None, "club life"),
+            ("radio edit (Argy remix)", None, "radio edit (Argy Remix)"),
+            ("Song (feat. someone)", None, "Song (feat. someone)"),
+            ("Song [feat. someone]", None, "Song [feat. someone]"),
+            ("Song (the remixes)", None, "Song (the remixes)"),
+            ("Song (mixed by someone)", None, "Song (mixed by someone)"),
+            ("Song (dubstep edit)", None, "Song (dubstep Edit)"),
+            ("Song (feat. van dyke) (dub)", None, "Song (feat. van dyke) (Dub)"),
+            ("Cola", "Cola (Original Mix)", "Cola (Original Mix)"),
+            ("Cola", "cola (original mix)", "Cola (Original Mix)"),
+            ("Cola", "Cola [ORIGINAL MIX]  ", "Cola (Original Mix)"),
+            ("Cola (feat. X)", "Cola (Original Mix)", "Cola (feat. X) (Original Mix)"),
+            ("Cola", "Cola", "Cola"),
+            ("Cola", None, "Cola"),
+            ("Cola", "Cola (Extended Mix)", "Cola"),
+            ("Cola", "Cola (Original Mix) bar", "Cola"),
+            ("Cola (extended mix)", "Cola (Original Mix)", "Cola (Extended Mix)"),
+            ("Cola (Argy remix)", "Cola (Original Mix)", "Cola (Argy Remix)"),
+            ("Cola (re-edit)", None, "Cola (Re-Edit)"),
+            ("Cola (someone re-edit)", None, "Cola (someone Re-Edit)"),
+            ("Cola (Re-edit)", None, "Cola (Re-Edit)"),
+            ("Cola (Re-Edit)", None, "Cola (Re-Edit)"),
+            ("Cola [re-edit]", None, "Cola [Re-Edit]"),
+            ("Cola (radio-edit)", None, "Cola (Radio-Edit)"),
+            ("Cola (non-vocal mix)", None, "Cola (Non-Vocal Mix)"),
+            ("Cola (12-inch mix)", None, "Cola (12-inch Mix)"),
+            ("Cola (lo-fi version)", None, "Cola (lo-fi Version)"),
+            ("re-edit Cola", None, "re-edit Cola"),
+            ("Cola (re-edit)", "Cola (Original Mix)", "Cola (Re-Edit)"),
+        ],
+    )
+    def test_house_style_title(
+        self, source: str, current: str | None, expected: str
+    ) -> None:
+        assert house_style_title(source, current) == expected

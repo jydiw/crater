@@ -42,6 +42,28 @@ _MIX_DESCRIPTORS = frozenset(
 
 _TRAILING_GROUP_RE = re.compile(r"[(\[]([^()\[\]]*)[)\]]\s*$")
 
+# House style, not matching: unrelated to _MIX_DESCRIPTORS above.
+_HOUSE_STYLE_WORDS = frozenset(
+    {
+        "remix",
+        "mix",
+        "edit",
+        "dub",
+        "version",
+        "instrumental",
+        "rework",
+        "bootleg",
+        "original",
+        "extended",
+        "radio",
+        "club",
+        "vocal",
+    }
+)
+_BRACKET_GROUP_RE = re.compile(r"[(\[][^()\[\]]*[)\]]")
+_WORD_RE = re.compile(r"\w+(?:-\w+)*")
+_ORIGINAL_MIX_RE = re.compile(r"[(\[]original mix[)\]]\s*$", re.IGNORECASE)
+
 
 def normalize(s: str) -> str:
     """Casefolded, punctuation-free form for comparing artist/title strings."""
@@ -87,3 +109,39 @@ def artist_overlaps(a: str, b: str) -> bool:
     if not left or not right:
         return False
     return left in right or right in left
+
+
+def _capitalise_word(match: re.Match[str]) -> str:
+    parts = match.group().split("-")
+    if not any(part.casefold() in _HOUSE_STYLE_WORDS for part in parts):
+        return match.group()
+    return "-".join(part[0].upper() + part[1:] for part in parts)
+
+
+def _capitalise_group(match: re.Match[str]) -> str:
+    return _WORD_RE.sub(_capitalise_word, match.group())
+
+
+def _has_mix_descriptor(title: str) -> bool:
+    return any(
+        part.casefold() in _HOUSE_STYLE_WORDS
+        for group in _BRACKET_GROUP_RE.findall(title)
+        for word in _WORD_RE.findall(group)
+        for part in word.split("-")
+    )
+
+
+def house_style_title(source: str, current: str | None) -> str:
+    """The Source title with crater's House style applied.
+
+    Sources drop `(Original Mix)`, but a DJ library keeps it to tell the
+    original apart from remixes, so a file that already has it keeps it.
+    """
+    styled = _BRACKET_GROUP_RE.sub(_capitalise_group, source)
+    if (
+        current is not None
+        and _ORIGINAL_MIX_RE.search(current)
+        and not _has_mix_descriptor(source)
+    ):
+        return f"{styled} (Original Mix)"
+    return styled
