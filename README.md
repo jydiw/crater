@@ -7,7 +7,7 @@ and organizes files into a canonical store with symlink-based views.
 
 | Module | Status |
 |--------|--------|
-| `tags diff` | Working (registration + AcoustID/MusicBrainz lookup) |
+| `tags diff` | Working (multi-source lookup: MB text-match, Deezer, iTunes, album art) |
 | `tags apply` | Working |
 | `tags revert` | Working |
 | `tags history` | Working |
@@ -20,8 +20,8 @@ and organizes files into a canonical store with symlink-based views.
 
 ## Installation
 
-Requires Python 3.13 and [`fpcalc`](https://acoustid.org/chromaprint) (for future
-AcoustID fingerprinting).
+Requires Python 3.13. [`fpcalc`](https://acoustid.org/chromaprint) is optional —
+only needed for AcoustID fingerprint fallback (files MB text search can't match).
 
 ```bash
 # macOS
@@ -40,12 +40,17 @@ Create `~/.config/crater/config.toml`:
 library_root = "/path/to/your/dj/library"
 
 [tags]
-prefer = "earliest"                # or "acquired" — which MB release drives album/year/label
-preserve_if_set = ["bpm"]          # never overwrite these fields when the file already has a value
-acoustid_key = "YOUR_KEY"          # https://acoustid.org/login
-acoustid_skip_threshold = 0.90     # skip fingerprinting when stored confidence ≥ this
-acoustid_high_threshold = 0.90     # score ≥ this → decision=accept (auto)
-acoustid_medium_threshold = 0.75   # score ≥ this → decision=review (medium confidence)
+prefer = "earliest"                # "earliest" | "acquired" — which MB release drives album/year/label
+preserve_if_set = ["bpm"]          # never propose overwriting these if already tagged
+# acoustid_key = "YOUR_KEY"        # optional — https://acoustid.org/login
+                                   # without it, files MB text search can't match are skipped
+acoustid_skip_threshold = 0.90     # skip re-lookup when stored score ≥ this
+acoustid_high_threshold = 0.90     # score ≥ this → decision=accept, confidence=high
+acoustid_medium_threshold = 0.75   # score ≥ this → confidence=medium (review)
+
+# [tags.sources]                   # per-field source priority, highest first
+# genre = ["deezer", "itunes", "musicbrainz"]
+# bpm = ["deezer"]                 # [] means "never propose it"
 ```
 
 Or use environment variables:
@@ -71,9 +76,12 @@ The library root must exist and will hold:
 
 ### `crater tags diff`
 
-Registers any new files in the database (file tags → DB) and runs an AcoustID
-fingerprint + MusicBrainz lookup against each one. Tracks where MB has
-something to propose are written to a review CSV.
+Registers any new files in the database (file tags → DB) and runs a
+multi-source metadata lookup: MusicBrainz text search first (AcoustID
+fingerprint fallback if `acoustid_key` is configured), then Deezer, iTunes
+Search, and Cover Art Archive for supplementary fields. Tracks with proposed
+changes are written to a review CSV; album art is staged to
+`{library_root}/review/art/` for inspection before apply.
 
 ```bash
 # Register + look up one or more files
@@ -81,6 +89,9 @@ crater tags diff track.flac
 
 # Multiple files
 crater tags diff ~/Downloads/*.mp3
+
+# Propose cover art even for files that already have some
+crater tags diff track.flac --replace-art
 
 # Save to a specific file (default: {library_root}/review/YYYY-MM-DD-HHMMSS.csv)
 crater tags diff track.flac --out tmp/review.csv
@@ -94,9 +105,11 @@ Progress prints one line per track:
 [3/3] Boards of Canada — Roygbiv … 2 change(s)
 ```
 
-The review CSV has **two rows per track** (`row_kind = before | after`) with
-one column per taggable field. Editing an `after` cell is an implicit override.
-The per-track `decision` column on the `after` row is one of:
+The review CSV has **up to three rows per track**: `before` (current file state),
+`after` (proposed values), and `source` (which source produced each changed
+value). The last column, `album_art`, shows art status. Editing an `after` cell
+is an implicit override. The per-track `decision` column on the `after` row is
+one of:
 
 | `decision` value | Effect |
 |---|---|
@@ -115,10 +128,11 @@ Confidence bands (driven by AcoustID score):
 **Lookup short-circuits:**
 - Tracks where you've already accepted a diff (`tags_reviewed_at` is set) are
   skipped entirely.
-- Tracks with a stored confidence ≥ `acoustid_skip_threshold` skip the
-  fingerprint step and go straight to MusicBrainz (cache-first).
+- Tracks with a stored `recording_mbid` and confidence ≥ `acoustid_skip_threshold`
+  go straight to the MusicBrainz recording lookup, skipping both text search and
+  fingerprinting.
 
-MusicBrainz responses are cached in the `mb_cache` table, so re-running `diff`
+All source responses are cached in the `source_cache` table, so re-running `diff`
 on the same files doesn't hit the network again.
 
 ### `crater tags apply`
@@ -206,6 +220,26 @@ crater tags forget 12 --yes
 crater tags prune --dry-run
 crater tags prune
 crater tags prune --yes
+```
+
+### Live smoke
+
+```bash
+# Pick a few real files and generate a diff
+crater tags diff track1.flac track2.mp3 track3.flac
+
+# Open the CSV and inspect any fetched art before applying
+open ~/Music/DJ/review/*.csv
+open ~/Music/DJ/review/art/
+
+# Apply the approved rows
+crater tags apply 2026-08-02-120000.csv
+
+# Confirm tags landed: re-diff should produce no changes
+crater tags diff track1.flac track2.mp3 track3.flac
+
+# Undo if needed
+crater tags revert <batch_id>
 ```
 
 ---

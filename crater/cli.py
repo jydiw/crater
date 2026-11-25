@@ -6,6 +6,7 @@ import click
 
 from crater import config as cfg_mod
 from crater.db.connection import open_db
+from crater.db.repo import SourceCacheRepo
 from crater.tags.api import (
     apply_diff,
     find_track,
@@ -19,13 +20,43 @@ from crater.tags.api import (
     track_history,
     write_diff_csv,
 )
+from crater.tags.art import ArtStager, CaaArtSource
+from crater.tags.enrich import (
+    KNOWN_SOURCES,
+    ArtSource,
+    DeezerArtSource,
+    DeezerSource,
+    ITunesArtSource,
+    ITunesSource,
+    MbGenreFetcher,
+    unknown_field_names,
+    unknown_source_names,
+)
 from crater.tags.errors import CraterError
 from crater.tags.lookup import LookupConfig, RealMbClient
+from crater.tags.merge import DEFAULT_FIELD_SOURCES
+from crater.tags.ratelimit import RateLimiter
 
 
 def _default_review_path(library_root: Path) -> Path:
     ts = datetime.now().strftime("%Y-%m-%d-%H%M%S")
     return library_root / "review" / f"{ts}.csv"
+
+
+def _art_sources(
+    names: tuple[str, ...], cache: SourceCacheRepo, limiter: RateLimiter
+) -> list[ArtSource]:
+    """The art lookup chain, in configured order. Names crater has no source for
+    were already warned about."""
+    sources: list[ArtSource] = []
+    for name in names:
+        if name == "coverartarchive":
+            sources.append(CaaArtSource())
+        elif name == "deezer":
+            sources.append(DeezerArtSource(cache, limiter))
+        elif name == "itunes":
+            sources.append(ITunesArtSource(cache, limiter))
+    return sources
 
 
 def _resolve_out_path(out: Path | None, library_root: Path) -> Path:
@@ -97,6 +128,12 @@ def tags() -> None:
     default=None,
     help="Which release to prefer for MB tags. Overrides config.",
 )
+@click.option(
+    "--replace-art",
+    is_flag=True,
+    default=False,
+    help="Propose cover art even for files that already have some.",
+)
 @click.pass_context
 def tags_diff(
     ctx: click.Context,
@@ -104,6 +141,7 @@ def tags_diff(
     out: Path | None,
     track_ids: tuple[int, ...],
     source: str | None,
+    replace_art: bool,
 ) -> None:
     """Register tracks and generate a MB tag diff CSV for review.
 
@@ -120,11 +158,14 @@ def tags_diff(
     prefer = source or cfg_mod.tags_prefer(crater_cfg)
     preserve_if_set = cfg_mod.tags_preserve_if_set(crater_cfg)
 
-    try:
-        acoustid_key = cfg_mod.require_acoustid_key(crater_cfg)
-    except CraterError as exc:
-        click.echo(f"error: {exc}", err=True)
-        sys.exit(1)
+    acoustid_key = cfg_mod.tags_acoustid_key(crater_cfg)
+
+    field_sources = {**DEFAULT_FIELD_SOURCES, **cfg_mod.tags_sources(crater_cfg)}
+    for name in unknown_field_names(field_sources):
+        click.echo(f"warning: unknown tag field '{name}' (skipped)", err=True)
+        del field_sources[name]
+    for name in unknown_source_names(field_sources, KNOWN_SOURCES):
+        click.echo(f"warning: unknown tag source '{name}' (skipped)", err=True)
 
     lookup_cfg = LookupConfig(
         prefer=prefer,  # type: ignore[arg-type]
@@ -132,15 +173,27 @@ def tags_diff(
         acoustid_skip=cfg_mod.tags_acoustid_skip(crater_cfg),
         acoustid_high=cfg_mod.tags_acoustid_high(crater_cfg),
         acoustid_medium=cfg_mod.tags_acoustid_medium(crater_cfg),
+        fingerprint_enabled=acoustid_key is not None,
+        replace_art=replace_art,
+        field_sources=field_sources,
     )
-    client = RealMbClient(acoustid_key=acoustid_key)
+    limiter = RateLimiter()
+    client = RealMbClient(acoustid_key=acoustid_key, rate_limiter=limiter)
 
     conn = open_db(db_path)
+    cache = SourceCacheRepo(conn)
+    art_sources = _art_sources(cfg_mod.tags_art_sources(crater_cfg), cache, limiter)
     diffs = generate_diff(
         conn,
         list(paths),
         client=client,
         lookup_cfg=lookup_cfg,
+        enrichers={
+            "deezer": DeezerSource(cache, limiter),
+            "itunes": ITunesSource(cache, limiter),
+        },
+        mb_genre_fetcher=MbGenreFetcher(cache, limiter),
+        art_stager=ArtStager(library_root / "review" / "art", limiter, art_sources),
         progress=lambda line: click.echo(line),
     )
     conn.close()

@@ -5,6 +5,7 @@ import time
 from pathlib import Path
 
 from crater.db.repo import BatchRepo, ChangeRepo, TrackRepo
+from crater.tags.art import _EXT, ArtBlob, embed_art, read_art, sniff_mime
 from crater.tags.diff import read_diff_csv
 from crater.tags.errors import TagIOError
 from crater.tags.io import read_tags, write_tags
@@ -39,6 +40,43 @@ def apply_diff(
     return result
 
 
+def _plan_art(d: TrackDiff, *, force: bool, result: ApplyResult) -> ArtBlob | None:
+    """Check the staged image against the file as it stands now. Returns the
+    blob to embed, or None with a skip recorded."""
+    assert d.art is not None
+    if not d.art.staged.exists():
+        result.skipped_drift.append((d.track_id, "album_art (staged file missing)"))
+        return None
+
+    if (read_art(d.path) is not None) != d.art.had_art and not force:
+        result.skipped_drift.append((d.track_id, "album_art"))
+        return None
+
+    data = d.art.staged.read_bytes()
+    mime = sniff_mime(data)
+    if mime is None:
+        result.skipped_drift.append((d.track_id, "album_art (unknown image format)"))
+        return None
+    return ArtBlob(data, mime)
+
+
+def _embed_art_change(
+    d: TrackDiff, blob: ArtBlob, batch_id: int
+) -> tuple[str, str | None, str | None]:
+    """Stash whatever picture the file carries now so revert can put it back,
+    embed the staged one, and return the change row."""
+    assert d.art is not None
+    current = read_art(d.path)
+    stash: Path | None = None
+    if current is not None:
+        ext = _EXT.get(current.mime, "")
+        stash = d.art.staged.parent / "stash" / f"{d.track_id}-{batch_id}{ext}"
+        stash.parent.mkdir(parents=True, exist_ok=True)
+        stash.write_bytes(current.data)
+    embed_art(d.path, blob)
+    return ("album_art", str(stash) if stash is not None else None, str(d.art.staged))
+
+
 def _apply_track(
     conn: sqlite3.Connection,
     d: TrackDiff,
@@ -58,15 +96,11 @@ def _apply_track(
         result.errors.append(f"{d.path}: {exc}")
         return
 
-    changes = d.changed_fields()
-    if not changes:
-        return
-
     updates: dict[str, str | None] = {}
     history: list[tuple[str, str | None, str | None]] = []
     needs_file_write = False
 
-    for field_name, before_val, after_val in changes:
+    for field_name, before_val, after_val in d.changed_fields():
         current = current_str(current_tags, field_name)
 
         if current == after_val:
@@ -84,11 +118,13 @@ def _apply_track(
         updates[field_name] = after_val
         history.append((field_name, before_val, after_val))
 
-    if not updates:
+    art_blob = None if d.art is None else _plan_art(d, force=force, result=result)
+
+    if not updates and art_blob is None:
         return
 
     if dry_run:
-        result.applied += len(updates)
+        result.applied += len(updates) + (1 if art_blob is not None else 0)
         return
 
     if needs_file_write:
@@ -98,6 +134,9 @@ def _apply_track(
         except TagIOError as exc:
             result.errors.append(f"{d.path}: file write failed: {exc}")
             return
+
+    if art_blob is not None:
+        history.append(_embed_art_change(d, art_blob, batch_id))
 
     db_updates: dict[str, object] = {f: to_db_value(f, v) for f, v in updates.items()}
     repo = TrackRepo(conn)

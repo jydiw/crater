@@ -17,9 +17,12 @@ from collections.abc import Callable, Iterable
 from pathlib import Path
 
 from crater.db.repo import TrackRepo
+from crater.tags.art import ArtStager
+from crater.tags.enrich import MbGenreFetcher
 from crater.tags.io import detect_format, read_tags
 from crater.tags.lookup import LookupConfig, MbClient, lookup_track
-from crater.tags.models import TAGGABLE_FIELDS, TrackDiff, TrackTags
+from crater.tags.merge import MetadataSource
+from crater.tags.models import TAGGABLE_FIELDS, ArtChange, TrackDiff, TrackTags
 from crater.tags.values import current_str
 
 _META_FIELDS: tuple[str, ...] = (
@@ -30,7 +33,8 @@ _META_FIELDS: tuple[str, ...] = (
     "confidence",
     "notes",
 )
-_CSV_FIELDS: tuple[str, ...] = _META_FIELDS + TAGGABLE_FIELDS
+# album_art stays last so older CSVs (no such column) still read cleanly
+_CSV_FIELDS: tuple[str, ...] = _META_FIELDS + TAGGABLE_FIELDS + ("album_art",)
 
 
 def _tags_to_dict(tags: TrackTags) -> dict[str, str | None]:
@@ -67,6 +71,9 @@ def generate_diff(
     *,
     client: MbClient | None = None,
     lookup_cfg: LookupConfig | None = None,
+    enrichers: dict[str, MetadataSource] | None = None,
+    mb_genre_fetcher: MbGenreFetcher | None = None,
+    art_stager: ArtStager | None = None,
     progress: Callable[[str], None] | None = None,
 ) -> list[TrackDiff]:
     """Register tracks and return MB-proposed diffs.
@@ -92,7 +99,15 @@ def generate_diff(
     for i, (tid, path) in enumerate(registered, 1):
         row = repo.get_by_id(tid)
         assert row is not None
-        diff = lookup_track(conn, client, row, lookup_cfg=cfg)
+        diff = lookup_track(
+            conn,
+            client,
+            row,
+            lookup_cfg=cfg,
+            enrichers=enrichers,
+            mb_genre_fetcher=mb_genre_fetcher,
+            art_stager=art_stager,
+        )
         if progress is not None:
             label = f"{row['artist'] or '?'} — {row['title'] or path.name}"
             if diff is None:
@@ -100,7 +115,7 @@ def generate_diff(
             else:
                 n = len(diff.changed_fields())
                 progress(f"[{i}/{total}] {label} … {n} change(s)")
-        if diff is not None and diff.changed_fields():
+        if diff is not None and (diff.changed_fields() or diff.art):
             diffs.append(diff)
     return diffs
 
@@ -112,6 +127,19 @@ def write_diff_csv(diffs: list[TrackDiff], out: Path) -> None:
         for d in diffs:
             writer.writerow(_row_dict(d, "before"))
             writer.writerow(_row_dict(d, "after"))
+            if d.sources or d.art:
+                writer.writerow(_source_row_dict(d))
+
+
+def _art_cell(d: TrackDiff, kind: str) -> str:
+    """before = whether the file already had a picture, after = the staged image."""
+    if d.art is None:
+        return ""
+    if kind == "before":
+        return "present" if d.art.had_art else ""
+    if kind == "after":
+        return str(d.art.staged)
+    return d.art.source
 
 
 def _row_dict(d: TrackDiff, kind: str) -> dict[str, object]:
@@ -126,6 +154,15 @@ def _row_dict(d: TrackDiff, kind: str) -> dict[str, object]:
     }
     for f in TAGGABLE_FIELDS:
         row[f] = values.get(f) or ""
+    row["album_art"] = _art_cell(d, kind)
+    return row
+
+
+def _source_row_dict(d: TrackDiff) -> dict[str, object]:
+    """Provenance row: which source won each changed field. Read back as an
+    unknown row_kind, so apply never sees it."""
+    row = _row_dict(d, "source")
+    row.update({f: d.sources.get(f, "") for f in TAGGABLE_FIELDS})
     return row
 
 
@@ -162,6 +199,13 @@ def read_diff_csv(path: Path) -> list[TrackDiff]:
         before = {f: (before_rec.get(f) or None) for f in TAGGABLE_FIELDS}
         after = {f: (after_rec.get(f) or None) for f in TAGGABLE_FIELDS}
 
+        staged = (after_rec.get("album_art") or "").strip()
+        art = (
+            ArtChange(Path(staged), had_art=before_rec.get("album_art") == "present")
+            if staged
+            else None
+        )
+
         diffs.append(
             TrackDiff(
                 track_id=track_id,
@@ -171,6 +215,7 @@ def read_diff_csv(path: Path) -> list[TrackDiff]:
                 before=before,
                 after=after,
                 notes=after_rec.get("notes", ""),
+                art=art,
             )
         )
 

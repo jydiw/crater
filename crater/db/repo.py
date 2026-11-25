@@ -75,36 +75,36 @@ class TrackRepo:
         self._conn.commit()
 
 
-class MbCacheRepo:
+class SourceCacheRepo:
     def __init__(self, conn: sqlite3.Connection) -> None:
         self._conn = conn
 
-    def get(self, recording_mbid: str) -> dict | None:
+    def get(self, source: str, cache_key: str) -> dict | list | None:
         row = self._conn.execute(
-            "SELECT payload FROM mb_cache WHERE recording_mbid = ?",
-            (recording_mbid,),
+            "SELECT payload FROM source_cache WHERE source = ? AND cache_key = ?",
+            (source, cache_key),
         ).fetchone()
         if row is None:
             return None
         return json.loads(row["payload"])
 
-    def put(self, recording_mbid: str, payload: dict) -> None:
+    def put(self, source: str, cache_key: str, payload: dict | list) -> None:
         self._conn.execute(
             """
-            INSERT INTO mb_cache (recording_mbid, payload)
-            VALUES (?, ?)
-            ON CONFLICT(recording_mbid) DO UPDATE SET
+            INSERT INTO source_cache (source, cache_key, payload)
+            VALUES (?, ?, ?)
+            ON CONFLICT(source, cache_key) DO UPDATE SET
                 payload = excluded.payload,
                 fetched_at = strftime('%s','now')
             """,
-            (recording_mbid, json.dumps(payload)),
+            (source, cache_key, json.dumps(payload)),
         )
         self._conn.commit()
 
-    def delete(self, recording_mbid: str) -> None:
+    def delete(self, source: str, cache_key: str) -> None:
         self._conn.execute(
-            "DELETE FROM mb_cache WHERE recording_mbid = ?",
-            (recording_mbid,),
+            "DELETE FROM source_cache WHERE source = ? AND cache_key = ?",
+            (source, cache_key),
         )
         self._conn.commit()
 

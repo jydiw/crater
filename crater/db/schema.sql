@@ -60,10 +60,12 @@ CREATE TABLE change (
 CREATE INDEX idx_change_track ON change(track_id, changed_at);
 CREATE INDEX idx_change_batch ON change(batch_id);
 
-CREATE TABLE mb_cache (
-    recording_mbid TEXT PRIMARY KEY,
-    payload        TEXT NOT NULL,
-    fetched_at     INTEGER NOT NULL DEFAULT (strftime('%s','now'))
+CREATE TABLE source_cache (
+    source     TEXT NOT NULL,
+    cache_key  TEXT NOT NULL,
+    payload    TEXT NOT NULL,
+    fetched_at INTEGER NOT NULL DEFAULT (strftime('%s','now')),
+    PRIMARY KEY (source, cache_key)
 ) STRICT;
 
 CREATE TABLE schema_version (

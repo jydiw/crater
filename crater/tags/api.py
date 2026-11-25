@@ -5,15 +5,18 @@ from collections.abc import Callable, Iterable
 from pathlib import Path
 
 from crater.tags.apply import apply_diff as _apply_diff
+from crater.tags.art import ArtStager
 from crater.tags.delete import forget_track as _forget_track
 from crater.tags.delete import list_missing as _list_missing
 from crater.tags.delete import prune_missing as _prune_missing
 from crater.tags.diff import generate_diff as _generate_diff
 from crater.tags.diff import read_diff_csv as _read_diff_csv
 from crater.tags.diff import write_diff_csv as _write_diff_csv
+from crater.tags.enrich import MbGenreFetcher
 from crater.tags.history import format_history as _format_history
 from crater.tags.history import track_history as _track_history
 from crater.tags.lookup import LookupConfig, MbClient
+from crater.tags.merge import MetadataSource
 from crater.tags.models import ApplyResult, HistoryEntry, RevertResult, TrackDiff
 from crater.tags.revert import revert_batch as _revert_batch
 from crater.tags.tracks import find_track as _find_track
@@ -25,6 +28,9 @@ def generate_diff(
     *,
     client: MbClient | None = None,
     lookup_cfg: LookupConfig | None = None,
+    enrichers: dict[str, MetadataSource] | None = None,
+    mb_genre_fetcher: MbGenreFetcher | None = None,
+    art_stager: ArtStager | None = None,
     progress: Callable[[str], None] | None = None,
 ) -> list[TrackDiff]:
     return _generate_diff(
@@ -32,6 +38,9 @@ def generate_diff(
         paths or [],
         client=client,
         lookup_cfg=lookup_cfg,
+        enrichers=enrichers,
+        mb_genre_fetcher=mb_genre_fetcher,
+        art_stager=art_stager,
         progress=progress,
     )
 

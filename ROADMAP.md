@@ -68,10 +68,10 @@ deferred as well: crater computes `content_hash` in place, no file moves.
 | source | auth | gives crater | phase |
 |---|---|---|---|
 | MusicBrainz | none (User-Agent + 1 rps) | identity, album, year, label, MBIDs — **built** | done |
-| MusicBrainz genres (`inc=genres`) | none | genre (generic but free) | P1 |
-| Deezer API | none | **per-track BPM**, release date, album genre | P1 |
-| iTunes Search API | none | genre (Apple taxonomy), release date | P1 |
-| Cover Art Archive | none | album art (embedded, not just fetched) | P1 |
+| MusicBrainz genres (`inc=genres`) | none | genre (generic but free) — **built** | done |
+| Deezer API | none | **per-track BPM**, release date, album genre — **built** | done |
+| iTunes Search API | none | genre (Apple taxonomy), release date — **built** | done |
+| Cover Art Archive | none | album art (embedded, not just fetched) — **built** | done |
 | AcoustID | free key, one signup | fingerprint → recording MBID — **built**, becomes optional | done |
 | rille | none — local SQLite DB | key + `key_source`, joined on `content_hash` | P4 |
 | Beatport | none (scraping) | DJ-accurate genre, key, BPM, catalog # | parked |
@@ -100,7 +100,7 @@ history`, `crater tags forget`, `crater tags prune`, and the thin Click
 wrappers over each.
 Verify: pytest; manual round-trip — apply a batch, revert it, history shows both.
 
-### P1 — metadata source adapters + merge policy + album art  [Opus: design-sensitive]
+### P1 — metadata source adapters + merge policy + album art  [done 2026-08-02 — live smoke pending]
 - Generalize the lookup layer: a `MetadataSource` protocol (the existing
   `MbClient` Protocol is the seed). Each adapter returns per-field proposals
   with provenance.

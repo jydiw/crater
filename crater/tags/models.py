@@ -44,6 +44,15 @@ Decision = Literal["accept", "reject", "review"]
 Confidence = Literal["high", "medium", "low", "review"]
 
 
+@dataclass(frozen=True)
+class ArtChange:
+    """Cover art proposed for one track: the image staged on disk at diff time,
+    plus whether the file already carried a picture back then."""
+    staged: Path
+    had_art: bool
+    source: str = "coverartarchive"
+
+
 @dataclass
 class TrackDiff:
     """One track's proposed tag changes. CSV rendering is two rows (before/after)."""
@@ -54,6 +63,8 @@ class TrackDiff:
     before: dict[str, str | None]
     after: dict[str, str | None]
     notes: str = ""
+    sources: dict[str, str] = field(default_factory=dict)
+    art: ArtChange | None = None
 
     def changed_fields(self) -> list[tuple[str, str | None, str | None]]:
         return [

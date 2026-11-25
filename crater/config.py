@@ -3,6 +3,7 @@ import sys
 import tomllib
 from pathlib import Path
 
+from crater.tags.enrich import ART_FIELD
 from crater.tags.errors import ConfigError
 
 
@@ -25,11 +26,19 @@ preserve_if_set = ["bpm"]          # never propose overwriting these if already 
 acoustid_skip_threshold = 0.90     # skip fingerprint when stored score ≥ this
 acoustid_high_threshold = 0.90     # score ≥ this → decision=accept, confidence=high
 acoustid_medium_threshold = 0.75   # score ≥ this → confidence=medium (review)
-# acoustid_key = "YOUR_KEY"        # https://acoustid.org/login
+# acoustid_key = "YOUR_KEY"        # optional — https://acoustid.org/login
+                                   # without it, files MB text search can't
+                                   # identify are skipped, not fingerprinted
                                    # ACOUSTID_KEY env var overrides this
+
+# [tags.sources]                   # per-field source priority, highest first.
+# genre = ["deezer", "itunes", "musicbrainz"]
+# bpm = ["deezer"]                 # [] means "never propose it"
 """
 
 _DEFAULT_PRESERVE_IF_SET: tuple[str, ...] = ("bpm",)
+# Album art source order, highest first. Overridable as `[tags.sources] album_art`.
+DEFAULT_ART_SOURCES: tuple[str, ...] = ("coverartarchive", "deezer", "itunes")
 _DEFAULT_SKIP_THRESHOLD = 0.90
 _DEFAULT_HIGH_THRESHOLD = 0.90
 _DEFAULT_MEDIUM_THRESHOLD = 0.75
@@ -75,16 +84,16 @@ def require_library_root(cfg: dict[str, object]) -> Path:
     return Path(str(val)).expanduser()
 
 
-def require_acoustid_key(cfg: dict[str, object]) -> str:
+def tags_acoustid_key(cfg: dict[str, object]) -> str | None:
+    """The AcoustID key, or None when none is configured.
+
+    Optional: without a key, files that MB text search can't identify are
+    skipped instead of fingerprinted.
+    """
     tags = cfg.get("tags", {})
     assert isinstance(tags, dict)
     key = tags.get("acoustid_key")
-    if not key:
-        raise ConfigError(
-            "acoustid_key not set. Use ACOUSTID_KEY env var or set "
-            "tags.acoustid_key in ~/.config/crater/config.toml"
-        )
-    return str(key)
+    return str(key) if key else None
 
 
 def tags_prefer(cfg: dict[str, object]) -> str:
@@ -105,6 +114,37 @@ def tags_preserve_if_set(cfg: dict[str, object]) -> list[str]:
             f"got {type(val).__name__}"
         )
     return [str(f) for f in val]
+
+
+def tags_sources(cfg: dict[str, object]) -> dict[str, tuple[str, ...]]:
+    """Per-field source priority from `[tags.sources]`.
+
+    Only the configured overrides — the caller merges them over the defaults.
+    """
+    tags = cfg.get("tags", {})
+    assert isinstance(tags, dict)
+    val = tags.get("sources")
+    if val is None:
+        return {}
+    if not isinstance(val, dict):
+        raise ConfigError(
+            "tags.sources must be a table of field = [source, ...], "
+            f"got {type(val).__name__}"
+        )
+    sources: dict[str, tuple[str, ...]] = {}
+    for field_name, names in val.items():
+        if not isinstance(names, list) or not all(isinstance(n, str) for n in names):
+            raise ConfigError(
+                f"tags.sources.{field_name} must be a list of source names, "
+                f"got {names!r}"
+            )
+        sources[field_name] = tuple(names)
+    return sources
+
+
+def tags_art_sources(cfg: dict[str, object]) -> tuple[str, ...]:
+    """Album art source order from `[tags.sources] album_art`, highest first."""
+    return tags_sources(cfg).get(ART_FIELD, DEFAULT_ART_SOURCES)
 
 
 def _float_from_tags(cfg: dict[str, object], key: str, default: float) -> float:

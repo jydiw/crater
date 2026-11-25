@@ -67,6 +67,19 @@ def read_tags(path: Path) -> TrackTags:
     return _read_flac(path)
 
 
+def read_duration(path: Path) -> float | None:
+    """Stream length in seconds, or None when the file won't parse.
+
+    Unlike tag reads this never raises: callers use duration as corroboration,
+    and a file we can't measure just means "unknown", not "broken".
+    """
+    try:
+        audio = mutagen.File(path)
+        return float(audio.info.length) if audio is not None else None
+    except Exception:
+        return None
+
+
 def _read_mp3(path: Path) -> TrackTags:
     try:
         audio = mutagen.mp3.MP3(path)
