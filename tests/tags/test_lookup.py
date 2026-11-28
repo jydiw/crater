@@ -41,9 +41,11 @@ class StubClient:
         mb_error: Exception | None = None,
         search_matches: list[RecordingMatch] | None = None,
         search_error: Exception | None = None,
+        recordings: dict[str, dict] | None = None,
     ) -> None:
         self._matches = matches or []
         self._recording = recording or _default_recording()
+        self._recordings = recordings or {}
         self._search_matches = search_matches or []
         self.fingerprint_error = fingerprint_error
         self.mb_error = mb_error
@@ -70,7 +72,7 @@ class StubClient:
         self.recording_ids.append(recording_mbid)
         if self.mb_error:
             raise self.mb_error
-        return dict(self._recording)
+        return dict(self._recordings.get(recording_mbid, self._recording))
 
 
 def _search_match(
@@ -238,7 +240,7 @@ class TestTextSearch:
         diff = lookup_track(db, client, row, lookup_cfg=_cfg())
 
         assert diff is not None
-        assert client.search_calls == 1
+        assert client.search_calls == 2  # the file's name, then the pool's MB name
         assert client.fingerprint_calls == 1
         assert "identity: acoustid" in diff.notes
 
@@ -280,7 +282,7 @@ class TestTextSearch:
         )
         lookup_track(db, client, row, lookup_cfg=_cfg())
 
-        assert client.search_calls == 0
+        assert client.search_calls == 1  # only the pool search, under the MB name
         assert client.fingerprint_calls == 1
 
     def test_search_is_cached_under_the_normalized_query(
@@ -292,7 +294,7 @@ class TestTextSearch:
         lookup_track(db, client, row, lookup_cfg=_cfg())
         second = lookup_track(db, client, row, lookup_cfg=_cfg())
 
-        assert client.search_calls == 1
+        assert client.search_calls == 2  # the file's name, then the pool's MB name
         assert second is not None
         assert "identity: mb-search" in second.notes  # cached matches still resolve
         assert (
@@ -314,7 +316,7 @@ class TestTextSearch:
         lookup_track(db, client, row, lookup_cfg=_cfg())
         lookup_track(db, client, row, lookup_cfg=_cfg())
 
-        assert client.search_calls == 1
+        assert client.search_calls == 2  # the file's name, then the pool's MB name
         assert client.recording_ids == ["rec-abc"]
 
     def test_search_error_skips_the_track(
@@ -433,6 +435,283 @@ class TestArtistCreditVariants:
 
         assert client.recording_ids == [SKY_FALLS_DOWN_ID]
         assert "identity: mb-search" in diff.notes
+
+
+# ---------------------------------------------------------------------------
+# Pooled Recordings: same name and length is one Recording
+# ---------------------------------------------------------------------------
+
+
+def _entry(recording_id: str, *releases: dict) -> dict:
+    """One MB entry under the fixture FLAC's own artist and title."""
+    return {
+        "id": recording_id,
+        "title": "Test Track",
+        "artist-credit": [{"name": "Test Artist"}],
+        "releases": list(releases),
+    }
+
+
+_REL_2003 = _release("rel-2003", "Album 2003", "2003-05-01")
+_REL_2002 = _release("rel-2002", "Album 2002", "2002-03-04")
+
+
+def _two_entries() -> dict[str, dict]:
+    return {
+        "rec-2003": _entry("rec-2003", _REL_2003),
+        "rec-2002": _entry("rec-2002", _REL_2002),
+    }
+
+
+class TestPooledRecordings:
+    @pytest.mark.parametrize("first", ["rec-2003", "rec-2002"])
+    def test_a_duplicate_entry_on_an_earlier_release_supplies_it(
+        self, db: sqlite3.Connection, flac_with_tags: Path, first: str
+    ) -> None:
+        second = "rec-2002" if first == "rec-2003" else "rec-2003"
+        client = StubClient(
+            search_matches=[
+                _search_match(recording_id=first),
+                _search_match(recording_id=second, duration_s=2.0),
+            ],
+            recordings=_two_entries(),
+        )
+
+        [diff] = generate_diff(
+            db,
+            [flac_with_tags],
+            client=client,
+            lookup_cfg=_cfg(fingerprint_enabled=False),
+        )
+
+        assert diff.after["album"] == "Album 2002"
+        assert diff.after["release_year"] == "2002"
+        assert diff.after["release_month"] == "3"
+        assert diff.after["release_day"] == "4"
+
+    @pytest.mark.parametrize("first", ["rec-2003", "rec-2002"])
+    def test_the_entry_on_the_chosen_release_is_proposed(
+        self, db: sqlite3.Connection, flac_with_tags: Path, tmp_path: Path, first: str
+    ) -> None:
+        row = _register(db, flac_with_tags)
+        second = "rec-2002" if first == "rec-2003" else "rec-2003"
+        client = StubClient(
+            search_matches=[
+                _search_match(recording_id=first),
+                _search_match(recording_id=second, duration_s=2.0),
+            ],
+            recordings=_two_entries(),
+        )
+        staged = tmp_path / "art.png"
+        staged.write_bytes(STAGED_PNG)
+        stager = StubStager(staged)
+
+        diff = lookup_track(
+            db,
+            client,
+            row,
+            lookup_cfg=_cfg(fingerprint_enabled=False),
+            art_stager=stager,  # type: ignore[arg-type]
+        )
+
+        assert diff is not None
+        assert diff.after["recording_mbid"] == "rec-2002"
+        assert diff.after["release_mbid"] == "rel-2002"
+        assert diff.after["earliest_mbid"] == "rel-2002"
+        [ctx] = stager.asked
+        assert (ctx.recording_mbid, ctx.release_mbid) == ("rec-2002", "rel-2002")
+
+    @pytest.mark.parametrize("first", ["rec-b", "rec-a"])
+    def test_a_release_on_two_entries_proposes_the_lowest_id(
+        self, db: sqlite3.Connection, flac_with_tags: Path, first: str
+    ) -> None:
+        second = "rec-a" if first == "rec-b" else "rec-b"
+        client = StubClient(
+            search_matches=[
+                _search_match(recording_id=first),
+                _search_match(recording_id=second, duration_s=2.0),
+            ],
+            recordings={
+                "rec-a": _entry("rec-a", _REL_2002),
+                "rec-b": _entry("rec-b", _REL_2002),
+            },
+        )
+
+        [diff] = generate_diff(
+            db,
+            [flac_with_tags],
+            client=client,
+            lookup_cfg=_cfg(fingerprint_enabled=False),
+        )
+
+        assert diff.after["recording_mbid"] == "rec-a"
+
+    def test_a_pool_with_no_official_release_proposes_the_matched_entry(
+        self, db: sqlite3.Connection, flac_with_tags: Path
+    ) -> None:
+        client = StubClient(
+            search_matches=[
+                _search_match(recording_id="rec-b"),
+                _search_match(recording_id="rec-a", duration_s=2.0),
+            ],
+            recordings={
+                "rec-b": _entry(
+                    "rec-b", _release("rel-b", "Promo B", "2003", status="Promotion")
+                ),
+                "rec-a": _entry(
+                    "rec-a", _release("rel-a", "Promo A", "2002", status="Promotion")
+                ),
+            },
+        )
+
+        [diff] = generate_diff(
+            db,
+            [flac_with_tags],
+            client=client,
+            lookup_cfg=_cfg(fingerprint_enabled=False),
+        )
+
+        assert diff.after["recording_mbid"] == "rec-b"
+        assert "release: no official release" in diff.notes
+
+    @pytest.mark.parametrize(
+        "other",
+        [
+            _search_match(recording_id="rec-1990", duration_s=400.0),
+            _search_match(recording_id="rec-1990", duration_s=None),
+            _search_match(recording_id="rec-1990", title="Other Track"),
+            _search_match(recording_id="rec-1990", artist="Other Artist"),
+        ],
+        ids=["far-length", "no-length", "other-title", "other-artist"],
+    )
+    def test_an_entry_that_is_another_recording_is_not_pooled(
+        self, db: sqlite3.Connection, flac_with_tags: Path, other: RecordingMatch
+    ) -> None:
+        rel_1990 = _release("rel-1990", "Album 1990", "1990-01-01")
+        client = StubClient(
+            search_matches=[_search_match(recording_id="rec-2003"), other],
+            recordings={
+                "rec-2003": _entry("rec-2003", _REL_2003),
+                "rec-1990": _entry("rec-1990", rel_1990),
+            },
+        )
+
+        [diff] = generate_diff(
+            db,
+            [flac_with_tags],
+            client=client,
+            lookup_cfg=_cfg(fingerprint_enabled=False),
+        )
+
+        assert diff.after["album"] == "Album 2003"
+        assert client.recording_ids == ["rec-2003"]
+
+    def test_a_stored_recording_id_is_pooled(
+        self, db: sqlite3.Connection, flac_with_tags: Path
+    ) -> None:
+        row = _register(db, flac_with_tags)
+        TrackRepo(db).update_tags(row["id"], {"recording_mbid": "rec-2003"})
+        TrackRepo(db).set_mb_confidence(row["id"], 0.95)
+        row = TrackRepo(db).get_by_id(row["id"])
+        client = StubClient(
+            search_matches=[_search_match(recording_id="rec-2002", duration_s=2.0)],
+            recordings=_two_entries(),
+        )
+
+        diff = lookup_track(db, client, row, lookup_cfg=_cfg())
+
+        assert diff is not None
+        assert diff.after["album"] == "Album 2002"
+        assert diff.after["recording_mbid"] == "rec-2002"
+
+    def test_a_fingerprint_match_is_pooled(
+        self, db: sqlite3.Connection, tmp_path: Path
+    ) -> None:
+        # No artist tag, so the text search is skipped and the fingerprint decides.
+        path = _write_silent_flac(tmp_path / "untitled.flac", {"title": "Test Track"})
+        client = StubClient(
+            matches=[AcoustIdMatch(0.95, "rec-2003")],
+            search_matches=[_search_match(recording_id="rec-2002", duration_s=2.0)],
+            recordings=_two_entries(),
+        )
+
+        [diff] = generate_diff(db, [path], client=client)
+
+        assert "identity: acoustid 0.95" in diff.notes
+        assert diff.after["album"] == "Album 2002"
+        assert diff.after["recording_mbid"] == "rec-2002"
+
+    def test_the_pool_search_reuses_the_identity_search_and_is_cached(
+        self, db: sqlite3.Connection, flac_with_tags: Path
+    ) -> None:
+        client = StubClient(
+            search_matches=[
+                _search_match(recording_id="rec-2003"),
+                _search_match(recording_id="rec-2002", duration_s=2.0),
+            ],
+            recordings=_two_entries(),
+        )
+        cfg = _cfg(fingerprint_enabled=False)
+
+        generate_diff(db, [flac_with_tags], client=client, lookup_cfg=cfg)
+        first = (client.search_calls, list(client.recording_ids))
+        [second] = generate_diff(db, [flac_with_tags], client=client, lookup_cfg=cfg)
+
+        assert first == (1, ["rec-2003", "rec-2002"])
+        assert (client.search_calls, client.recording_ids) == first
+        assert second.after["album"] == "Album 2002"
+
+    def test_a_stored_recording_id_costs_one_search(
+        self, db: sqlite3.Connection, flac_with_tags: Path
+    ) -> None:
+        row = _register(db, flac_with_tags)
+        TrackRepo(db).update_tags(row["id"], {"recording_mbid": "rec-2003"})
+        TrackRepo(db).set_mb_confidence(row["id"], 0.95)
+        row = TrackRepo(db).get_by_id(row["id"])
+        client = StubClient(recordings=_two_entries())
+
+        lookup_track(db, client, row, lookup_cfg=_cfg())
+        lookup_track(db, client, row, lookup_cfg=_cfg())
+
+        assert client.search_calls == 1
+        assert client.recording_ids == ["rec-2003"]
+
+    def test_a_failed_pool_search_skips_the_track(
+        self, db: sqlite3.Connection, flac_with_tags: Path
+    ) -> None:
+        from crater.tags.errors import MBLookupError
+
+        row = _register(db, flac_with_tags)
+        TrackRepo(db).update_tags(row["id"], {"recording_mbid": "rec-2003"})
+        TrackRepo(db).set_mb_confidence(row["id"], 0.95)
+        row = TrackRepo(db).get_by_id(row["id"])
+        client = StubClient(
+            recordings=_two_entries(), search_error=MBLookupError("mb down")
+        )
+
+        assert lookup_track(db, client, row, lookup_cfg=_cfg()) is None
+
+    def test_a_failed_lookup_of_a_pooled_entry_skips_the_track(
+        self, db: sqlite3.Connection, flac_with_tags: Path
+    ) -> None:
+        from crater.tags.errors import MBLookupError
+
+        row = _register(db, flac_with_tags)
+        SourceCacheRepo(db).put(
+            "mb-recording-releases", "rec-2003", _entry("rec-2003", _REL_2003)
+        )
+        client = StubClient(
+            search_matches=[
+                _search_match(recording_id="rec-2003"),
+                _search_match(recording_id="rec-2002", duration_s=2.0),
+            ],
+            mb_error=MBLookupError("mb down"),
+        )
+
+        diff = lookup_track(db, client, row, lookup_cfg=_cfg(fingerprint_enabled=False))
+
+        assert diff is None
+        assert client.recording_ids == ["rec-2002"]
 
 
 # ---------------------------------------------------------------------------
@@ -797,12 +1076,16 @@ def _two_page_payloads() -> dict[str, object]:
 
 
 def _register_with_stored_identity(db: sqlite3.Connection, path: Path) -> None:
-    """A confident recording ID already on the row, so no search request is made."""
+    """A confident recording ID already on the row, and the pool search for its
+    name already cached, so no search request is made."""
     generate_diff(db, [path])
     row = TrackRepo(db).get_by_path(path.resolve())
     assert row is not None
     TrackRepo(db).update_tags(row["id"], {"recording_mbid": "rec-abc"})
     TrackRepo(db).set_mb_confidence(row["id"], 0.95)
+    SourceCacheRepo(db).put(
+        "mb-search-100", "oceanlab|sky falls down armin van buuren remix", []
+    )
 
 
 class TestRealClientReleaseList:

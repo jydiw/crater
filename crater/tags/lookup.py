@@ -3,13 +3,16 @@
 Flow per track:
   1. If `tags_reviewed_at` is set on the DB row → skip entirely.
   2. Else if the file already has a `recording_mbid` and the stored
-     `mb_confidence` meets the skip threshold → go straight to MB (cache-first).
+     `mb_confidence` meets the skip threshold → identified, no identity search.
   3. Else search MB by the file's artist/title (cache-first) and take the first
      candidate that clears the `match` guards.
   4. Else, when an AcoustID key is configured, fingerprint with fpcalc, call
      AcoustID and pick the best match. Either way the score is persisted.
-  5. When identified: pull the recording and every Release carrying it from
-     MB (cache-first), take the Earliest release, run `mb_filter.payload_to_tags`.
+  5. When identified: pull the entry and its Releases from MB (cache-first),
+     then search MB (cached) on the entry's own artist/title and pool every
+     other entry with that artist/title whose length is within 3 s of the file.
+     Take the Earliest release across the pool and propose the entry carrying
+     it, via `mb_filter.payload_to_tags`. A failed pool request skips the Track.
      With no official Release only the Recording's fields are proposed and the
      notes say so. When not identified: no MB tags, and the enrichers and art
      sources carry the diff on their own.
@@ -268,6 +271,21 @@ def _parse_matches(cached: list[Any]) -> list[RecordingMatch]:
     return [RecordingMatch(**entry) for entry in cached]
 
 
+def _cached_search(
+    conn: sqlite3.Connection, client: MbClient, artist: str, title: str
+) -> list[RecordingMatch]:
+    """MB text search, cache-first. Raises MBLookupError when MB fails."""
+    cache = SourceCacheRepo(conn)
+    cache_key = f"{normalize(artist)}|{normalize(title)}"
+    cached = cache.get(MB_SEARCH_CACHE, cache_key)
+    if cached is None:
+        found = client.search_recording(artist, title)
+        cached = [asdict(m) for m in found]
+        cache.put(MB_SEARCH_CACHE, cache_key, cached)
+    assert isinstance(cached, list)  # the cache is shared with dict-shaped sources
+    return _parse_matches(cached)
+
+
 def _search_identity(
     conn: sqlite3.Connection,
     client: MbClient,
@@ -279,22 +297,15 @@ def _search_identity(
     if not artist or not title:
         return None
 
-    cache = SourceCacheRepo(conn)
-    cache_key = f"{normalize(artist)}|{normalize(title)}"
-    cached = cache.get(MB_SEARCH_CACHE, cache_key)
-    if cached is None:
-        try:
-            found = client.search_recording(artist, title)
-        except MBLookupError:
-            return None
-        cached = [asdict(m) for m in found]
-        cache.put(MB_SEARCH_CACHE, cache_key, cached)
-    assert isinstance(cached, list)  # the cache is shared with dict-shaped sources
+    try:
+        matches = _cached_search(conn, client, artist, title)
+    except MBLookupError:
+        return None
 
     duration_s = read_duration(Path(track_row["path"]))
     # A length is evidence a no-length hit cannot give, so every hit with one is
     # tried first; the sort is stable, keeping MB's order within each group.
-    for match in sorted(_parse_matches(cached), key=lambda m: m.duration_s is None):
+    for match in sorted(matches, key=lambda m: m.duration_s is None):
         ok = text_match_ok(
             match.score,
             normalize(match.artist or "") == normalize(artist),
@@ -353,6 +364,61 @@ def _resolve_identity(
     return _fingerprint_identity(conn, client, track_row)
 
 
+def _cached_recording(
+    conn: sqlite3.Connection, client: MbClient, recording_mbid: str
+) -> dict[str, Any]:
+    """The Recording and its Releases, cache-first. Raises MBLookupError."""
+    cache = SourceCacheRepo(conn)
+    payload = cache.get(MB_RECORDING_CACHE, recording_mbid)
+    if payload is None:
+        payload = client.get_recording(recording_mbid)
+        cache.put(MB_RECORDING_CACHE, recording_mbid, payload)
+    assert isinstance(payload, dict)  # the cache is shared with list-shaped sources
+    return payload
+
+
+def _pooled_entries(
+    conn: sqlite3.Connection,
+    client: MbClient,
+    matched_mbid: str,
+    matched: dict[str, Any],
+    duration_s: float | None,
+) -> list[tuple[str, dict[str, Any]]]:
+    """Every MB entry that is the matched Recording by name and length
+    (ADR 0001), matched first. Raises MBLookupError."""
+    pool = [(matched_mbid, matched)]
+    artist = artist_credit_join(matched.get("artist-credit") or [])
+    title = matched.get("title") or ""
+    if duration_s is None or not artist or not title:
+        return pool
+    for hit in _cached_search(conn, client, artist, title):
+        if (
+            hit.recording_id != matched_mbid
+            and artists_match(hit.artist or "", artist)
+            and titles_match_without_featuring(hit.title or "", title)
+            and duration_close(duration_s, hit.duration_s) is True
+        ):
+            payload = _cached_recording(conn, client, hit.recording_id)
+            pool.append((hit.recording_id, payload))
+    return pool
+
+
+def _carrier(
+    pool: list[tuple[str, dict[str, Any]]], release: dict[str, Any] | None
+) -> tuple[str, dict[str, Any]]:
+    """The pooled entry on `release`, lowest ID first so the pick never depends
+    on which entry matched; the matched entry when there is no Release."""
+    if release is None:
+        return pool[0]
+    release_id = release.get("id")
+    carriers = [
+        entry
+        for entry in pool
+        if any(r.get("id") == release_id for r in entry[1].get("releases") or [])
+    ]
+    return min(carriers, key=lambda entry: entry[0])
+
+
 def _propose_art(
     ctx: TrackContext,
     stager: ArtStager | None,
@@ -402,18 +468,21 @@ def lookup_track(
     # iTunes and the art sources search on the file's own artist/title.
     mb_tags: dict[str, str | None] = {}
     release: dict[str, Any] | None = None
+    recording_mbid: str | None = None
+    duration_s = read_duration(path)
     if identity is not None:
-        cache = SourceCacheRepo(conn)
-        payload = cache.get(MB_RECORDING_CACHE, identity.recording_mbid)
-        if payload is None:
-            try:
-                payload = client.get_recording(identity.recording_mbid)
-            except MBLookupError:
-                return None
-            cache.put(MB_RECORDING_CACHE, identity.recording_mbid, payload)
-        assert isinstance(payload, dict)  # the cache is shared with list-shaped sources
+        try:
+            payload = _cached_recording(conn, client, identity.recording_mbid)
+            pool = _pooled_entries(
+                conn, client, identity.recording_mbid, payload, duration_s
+            )
+        except MBLookupError:
+            return None
 
-        release = earliest_release(payload)
+        release = earliest_release(
+            {"releases": [r for _, p in pool for r in p.get("releases") or []]}
+        )
+        recording_mbid, payload = _carrier(pool, release)
         earliest_mbid = release.get("id") if release else None
         mb_tags = payload_to_tags(payload, release, earliest_mbid=earliest_mbid)
 
@@ -423,8 +492,8 @@ def lookup_track(
     ctx = TrackContext(
         path=path,
         before=before,
-        duration_s=read_duration(path),
-        recording_mbid=identity.recording_mbid if identity is not None else None,
+        duration_s=duration_s,
+        recording_mbid=recording_mbid,
         release_mbid=release.get("id") if release else None,
     )
     if identity is None:
