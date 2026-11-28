@@ -6,12 +6,16 @@ import pytest
 
 from crater.tags.match import (
     artist_overlaps,
+    artists_match,
+    drop_featuring_from_artist,
+    drop_featuring_from_title,
     duration_close,
     house_style_title,
     normalize,
     strip_mix_suffix,
     text_match_ok,
     titles_match,
+    titles_match_without_featuring,
 )
 
 
@@ -57,19 +61,21 @@ class TestDurationClose:
 
 class TestTextMatchOk:
     @pytest.mark.parametrize(
-        "score,artist_eq,title_eq,dur,expected",
+        "score,artist_eq,title_eq,names_match,dur,expected",
         [
-            # duration corroborates: score alone decides
-            (0.95, True, True, True, True),
-            (0.90, False, False, True, True),
-            (0.89, True, True, True, False),
+            # duration corroborates: a good score or matching names decide
+            (0.95, True, True, True, True, True),
+            (0.90, False, False, False, True, True),
+            (0.89, True, True, False, True, False),
+            (0.28, False, False, True, True, True),
+            (0.28, False, False, False, True, False),
             # duration unknown: needs a near-perfect score and exact strings
-            (0.95, True, True, None, True),
-            (0.94, True, True, None, False),
-            (0.95, False, True, None, False),
-            (0.95, True, False, None, False),
+            (0.95, True, True, False, None, True),
+            (0.94, True, True, True, None, False),
+            (0.95, False, True, True, None, False),
+            (0.95, True, False, True, None, False),
             # duration disagrees: nothing else matters
-            (1.0, True, True, False, False),
+            (1.0, True, True, True, False, False),
         ],
     )
     def test_text_match_ok(
@@ -77,10 +83,11 @@ class TestTextMatchOk:
         score: float,
         artist_eq: bool,
         title_eq: bool,
+        names_match: bool,
         dur: bool | None,
         expected: bool,
     ) -> None:
-        assert text_match_ok(score, artist_eq, title_eq, dur) is expected
+        assert text_match_ok(score, artist_eq, title_eq, names_match, dur) is expected
 
 
 class TestStripMixSuffix:
@@ -147,6 +154,107 @@ class TestArtistOverlaps:
     )
     def test_artist_overlaps(self, a: str, b: str, expected: bool) -> None:
         assert artist_overlaps(a, b) is expected
+
+
+class TestDropFeaturingFromArtist:
+    @pytest.mark.parametrize(
+        "raw,expected",
+        [
+            ("OceanLab feat. Justine Suissa", "OceanLab"),
+            ("OceanLab feat Justine Suissa", "OceanLab"),
+            ("OceanLab featuring Justine Suissa", "OceanLab"),
+            ("OceanLab ft. Justine Suissa", "OceanLab"),
+            ("OceanLab ft Justine Suissa", "OceanLab"),
+            ("OceanLab FEAT. Justine Suissa", "OceanLab"),
+            ("OceanLab Feature", "OceanLab Feature"),
+            ("Defeat", "Defeat"),
+            ("Soft Cell", "Soft Cell"),
+            ("Lift Off", "Lift Off"),
+            ("Above & Beyond presents OceanLab", "Above & Beyond presents OceanLab"),
+        ],
+    )
+    def test_drop_featuring_from_artist(self, raw: str, expected: str) -> None:
+        assert drop_featuring_from_artist(raw) == expected
+
+
+class TestDropFeaturingFromTitle:
+    @pytest.mark.parametrize(
+        "raw,expected",
+        [
+            (
+                "Sky Falls Down (feat. Justine Suissa) (Armin van Buuren Remix)",
+                "Sky Falls Down (Armin van Buuren Remix)",
+            ),
+            (
+                "Sky Falls Down (Armin van Buuren Remix) [feat. Justine Suissa]",
+                "Sky Falls Down (Armin van Buuren Remix)",
+            ),
+            ("Sky Falls Down (Featuring Justine Suissa)", "Sky Falls Down"),
+            ("Sky Falls Down [ft Justine Suissa]", "Sky Falls Down"),
+            (
+                "Sky Falls Down (Armin van Buuren Remix)",
+                "Sky Falls Down (Armin van Buuren Remix)",
+            ),
+            ("Defeat (Feature Mix)", "Defeat (Feature Mix)"),
+            # unbracketed: up to the next bracket or the end
+            ("Sky Falls Down feat. Justine Suissa", "Sky Falls Down"),
+            (
+                "Sky Falls Down ft. Justine Suissa (Armin van Buuren Remix)",
+                "Sky Falls Down (Armin van Buuren Remix)",
+            ),
+            (
+                "Sky Falls Down (Armin Remix feat. X)",
+                "Sky Falls Down (Armin Remix feat. X)",
+            ),
+        ],
+    )
+    def test_drop_featuring_from_title(self, raw: str, expected: str) -> None:
+        assert drop_featuring_from_title(raw) == expected
+
+
+class TestArtistsMatch:
+    @pytest.mark.parametrize(
+        "a,b,expected",
+        [
+            ("OceanLab", "Above & Beyond presents OceanLab", True),
+            ("OceanLab feat. Justine Suissa", "Above & Beyond presents OceanLab", True),
+            ("Armin van Buuren", "OceanLab", False),
+            ("Air", "Fairmont", False),
+            ("M", "Eminem", False),
+            ("Fairmont", "Air", False),
+            ("Air", "Air", True),
+            ("oceanlab", "OCEANLAB", True),
+            ("Above & Beyond", "Above & Beyond presents OceanLab", True),
+            ("Above OceanLab", "Above & Beyond presents OceanLab", False),
+            ("Air feat. Someone", "Fairmont", False),
+            ("Air feat. Someone", "Air", True),
+            ("", "OceanLab", False),
+        ],
+    )
+    def test_artists_match(self, a: str, b: str, expected: bool) -> None:
+        assert artists_match(a, b) is expected
+
+
+class TestTitlesMatchWithoutFeaturing:
+    @pytest.mark.parametrize(
+        "a,b,expected",
+        [
+            (
+                "Sky Falls Down (feat. Justine Suissa) (Armin van Buuren Remix)",
+                "Sky Falls Down (Armin van Buuren remix)",
+                True,
+            ),
+            (
+                "Sky Falls Down (feat. Justine Suissa) (Armin van Buuren Remix)",
+                "Sky Falls Down (Armin van Buuren extended mix)",
+                False,
+            ),
+        ],
+    )
+    def test_titles_match_without_featuring(
+        self, a: str, b: str, expected: bool
+    ) -> None:
+        assert titles_match_without_featuring(a, b) is expected
 
 
 class TestHouseStyleTitle:

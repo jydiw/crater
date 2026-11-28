@@ -37,10 +37,12 @@ from crater.tags.enrich import (
 from crater.tags.errors import MBLookupError
 from crater.tags.io import read_duration, read_tags
 from crater.tags.match import (
+    artists_match,
     duration_close,
     house_style_title,
     normalize,
     text_match_ok,
+    titles_match_without_featuring,
 )
 from crater.tags.mb_filter import (
     artist_credit_join,
@@ -65,7 +67,7 @@ from crater.tags.ratelimit import RateLimiter
 from crater.tags.values import current_str
 
 ACOUSTID_RPS = 3.0
-MB_SEARCH_LIMIT = 10
+MB_SEARCH_LIMIT = 100
 MB_WS = "https://musicbrainz.org/ws/2"
 MB_BROWSE_LIMIT = 100  # the most MB returns per browse page
 # MB sheds load with 503s and expects clients to retry; the fetcher's rate
@@ -74,6 +76,9 @@ MB_ATTEMPTS = 4
 # P1 cached the musicbrainzngs payload, which has no Release data, under
 # "mb-recording"; a new source name makes those entries miss.
 MB_RECORDING_CACHE = "mb-recording-releases"
+# Searches cached under "mb-search" asked for 10 hits, too few to reach a
+# length-matching hit ranked low by a differing credit; a new name makes them miss.
+MB_SEARCH_CACHE = "mb-search-100"
 
 
 @dataclass
@@ -276,22 +281,26 @@ def _search_identity(
 
     cache = SourceCacheRepo(conn)
     cache_key = f"{normalize(artist)}|{normalize(title)}"
-    cached = cache.get("mb-search", cache_key)
+    cached = cache.get(MB_SEARCH_CACHE, cache_key)
     if cached is None:
         try:
             found = client.search_recording(artist, title)
         except MBLookupError:
             return None
         cached = [asdict(m) for m in found]
-        cache.put("mb-search", cache_key, cached)
+        cache.put(MB_SEARCH_CACHE, cache_key, cached)
     assert isinstance(cached, list)  # the cache is shared with dict-shaped sources
 
     duration_s = read_duration(Path(track_row["path"]))
-    for match in _parse_matches(cached):
+    # A length is evidence a no-length hit cannot give, so every hit with one is
+    # tried first; the sort is stable, keeping MB's order within each group.
+    for match in sorted(_parse_matches(cached), key=lambda m: m.duration_s is None):
         ok = text_match_ok(
             match.score,
             normalize(match.artist or "") == normalize(artist),
             normalize(match.title or "") == normalize(title),
+            artists_match(match.artist or "", artist)
+            and titles_match_without_featuring(match.title or "", title),
             duration_close(duration_s, match.duration_s),
         )
         if ok:

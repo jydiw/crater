@@ -42,6 +42,18 @@ _MIX_DESCRIPTORS = frozenset(
 
 _TRAILING_GROUP_RE = re.compile(r"[(\[]([^()\[\]]*)[)\]]\s*$")
 
+# Whole words only, so "feature", "defeat", "soft" and "lift" are left alone.
+_FEATURING = r"\b(?:feat|featuring|ft)\b"
+_ARTIST_FEATURING_RE = re.compile(rf"\s*{_FEATURING}.*", re.IGNORECASE)
+# Any other bracketed part is matched as `keep` so a featuring word inside it,
+# such as "(X Remix feat. Y)", is not taken for an unbracketed phrase.
+_TITLE_FEATURING_RE = re.compile(
+    rf"[(\[]{_FEATURING}[^()\[\]]*[)\]]"
+    r"|(?P<keep>[(\[][^()\[\]]*[)\]])"
+    rf"|{_FEATURING}[^()\[\]]*",
+    re.IGNORECASE,
+)
+
 # House style, not matching: unrelated to _MIX_DESCRIPTORS above.
 _HOUSE_STYLE_WORDS = frozenset(
     {
@@ -80,13 +92,19 @@ def duration_close(
 
 
 def text_match_ok(
-    score: float, artist_eq: bool, title_eq: bool, dur: bool | None
+    score: float,
+    artist_eq: bool,
+    title_eq: bool,
+    names_match: bool,
+    dur: bool | None,
 ) -> bool:
+    """`names_match` is the looser featuring-blind comparison: with the length
+    agreeing, it stands in for a score that a differing credit drags down."""
     if dur is False:
         return False
     if dur is None:
         return score >= _SCORE_WITHOUT_DURATION and artist_eq and title_eq
-    return score >= _SCORE_WITH_DURATION
+    return score >= _SCORE_WITH_DURATION or names_match
 
 
 def strip_mix_suffix(title: str) -> str:
@@ -109,6 +127,33 @@ def artist_overlaps(a: str, b: str) -> bool:
     if not left or not right:
         return False
     return left in right or right in left
+
+
+def drop_featuring_from_artist(artist: str) -> str:
+    """The credit before any featuring phrase; MB often credits guests apart."""
+    return _ARTIST_FEATURING_RE.sub("", artist)
+
+
+def drop_featuring_from_title(title: str) -> str:
+    """The title without its featuring phrases, wherever the file put them."""
+    dropped = _TITLE_FEATURING_RE.sub(lambda m: m.group("keep") or " ", title)
+    return _WS_RE.sub(" ", dropped).strip()
+
+
+def artists_match(a: str, b: str) -> bool:
+    """Same credit for identity, once guests are dropped from both sides: one
+    contains the other as a run of whole words. Empty is never a match."""
+    left = normalize(drop_featuring_from_artist(a))
+    right = normalize(drop_featuring_from_artist(b))
+    if not left or not right:
+        return False
+    # normalize leaves single spaces and no punctuation, so padding with spaces
+    # makes substring containment line up on word boundaries.
+    return f" {left} " in f" {right} " or f" {right} " in f" {left} "
+
+
+def titles_match_without_featuring(a: str, b: str) -> bool:
+    return titles_match(drop_featuring_from_title(a), drop_featuring_from_title(b))
 
 
 def _capitalise_word(match: re.Match[str]) -> str:

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import sqlite3
 import time
+from dataclasses import asdict
 from pathlib import Path
 from typing import Any
 
@@ -50,6 +51,7 @@ class StubClient:
         self.fingerprint_calls = 0
         self.mb_calls = 0
         self.search_calls = 0
+        self.recording_ids: list[str] = []
 
     def search_recording(self, artist: str, title: str) -> list[RecordingMatch]:
         self.search_calls += 1
@@ -65,6 +67,7 @@ class StubClient:
 
     def get_recording(self, recording_mbid: str) -> dict[str, Any]:
         self.mb_calls += 1
+        self.recording_ids.append(recording_mbid)
         if self.mb_error:
             raise self.mb_error
         return dict(self._recording)
@@ -75,10 +78,11 @@ def _search_match(
     duration_s: float | None = 1.0,  # the fixture FLAC is exactly 1 second
     artist: str = "Test Artist",
     title: str = "Test Track",
+    recording_id: str = "rec-abc",
 ) -> RecordingMatch:
     return RecordingMatch(
         score=score,
-        recording_id="rec-abc",
+        recording_id=recording_id,
         artist=artist,
         title=title,
         duration_s=duration_s,
@@ -207,13 +211,28 @@ class TestTextSearch:
         assert client.fingerprint_calls == 0
         assert "identity: mb-search" in diff.notes
 
+    def test_a_length_matching_hit_beats_an_earlier_one_with_no_length(
+        self, db: sqlite3.Connection, flac_with_tags: Path
+    ) -> None:
+        row = _register(db, flac_with_tags)
+        client = StubClient(
+            search_matches=[
+                _search_match(duration_s=None, recording_id="rec-no-length"),
+                _search_match(score=0.91, recording_id="rec-length"),
+            ]
+        )
+
+        lookup_track(db, client, row, lookup_cfg=_cfg())
+
+        assert client.recording_ids == ["rec-length"]
+
     def test_weak_score_falls_through_to_the_fingerprint(
         self, db: sqlite3.Connection, flac_with_tags: Path
     ) -> None:
         row = _register(db, flac_with_tags)
         client = StubClient(
             matches=[AcoustIdMatch(0.95, "rec-abc")],
-            search_matches=[_search_match(score=0.50)],
+            search_matches=[_search_match(score=0.50, artist="Other Artist")],
         )
 
         diff = lookup_track(db, client, row, lookup_cfg=_cfg())
@@ -277,8 +296,26 @@ class TestTextSearch:
         assert second is not None
         assert "identity: mb-search" in second.notes  # cached matches still resolve
         assert (
-            SourceCacheRepo(db).get("mb-search", "test artist|test track") is not None
+            SourceCacheRepo(db).get("mb-search-100", "test artist|test track")
+            is not None
         )
+
+    def test_a_search_cached_with_ten_hits_is_fetched_again_once(
+        self, db: sqlite3.Connection, flac_with_tags: Path
+    ) -> None:
+        row = _register(db, flac_with_tags)
+        old = [
+            asdict(_search_match(duration_s=None, recording_id=f"rec-old-{i}"))
+            for i in range(10)
+        ]
+        SourceCacheRepo(db).put("mb-search", "test artist|test track", old)
+        client = StubClient(search_matches=[_search_match()])
+
+        lookup_track(db, client, row, lookup_cfg=_cfg())
+        lookup_track(db, client, row, lookup_cfg=_cfg())
+
+        assert client.search_calls == 1
+        assert client.recording_ids == ["rec-abc"]
 
     def test_search_error_skips_the_track(
         self, db: sqlite3.Connection, flac_with_tags: Path
@@ -292,6 +329,110 @@ class TestTextSearch:
 
         assert diff is None
         assert client.fingerprint_calls == 0
+
+
+# ---------------------------------------------------------------------------
+# Artist-credit variants, measured on live MusicBrainz
+# ---------------------------------------------------------------------------
+
+SKY_FALLS_DOWN_ID = "e0b55748-8780-499d-ba95-26010a29153a"
+SKY_FALLS_DOWN = "Sky Falls Down (Armin van Buuren Remix)"
+PRESENTS = "Above & Beyond presents OceanLab"
+
+
+def _sky_falls_down_hit(score: float) -> RecordingMatch:
+    return RecordingMatch(
+        score=score,
+        recording_id=SKY_FALLS_DOWN_ID,
+        artist=PRESENTS,
+        title="Sky Falls Down (Armin van Buuren remix)",
+        duration_s=1.0,
+    )
+
+
+# Within 3 seconds of the file, yet a different Recording by name.
+_EXTENDED_MIX = RecordingMatch(
+    score=0.28,
+    recording_id="rec-extended",
+    artist=PRESENTS,
+    title="Sky Falls Down (Armin van Buuren extended mix)",
+    duration_s=2.0,
+)
+
+
+def _no_length_hit(artist: str) -> RecordingMatch:
+    return RecordingMatch(
+        score=1.0,
+        recording_id="rec-no-length",
+        artist=artist,
+        title=SKY_FALLS_DOWN,
+        duration_s=None,
+    )
+
+
+class TestArtistCreditVariants:
+    @pytest.mark.parametrize(
+        "artist,title,decoys,score",
+        [
+            (PRESENTS, SKY_FALLS_DOWN, [], 1.00),
+            (
+                "Above & Beyond pres. OceanLab",
+                SKY_FALLS_DOWN,
+                [
+                    RecordingMatch(
+                        score=1.0,
+                        recording_id="rec-far",
+                        artist="Above & Beyond pres. OceanLab",
+                        title=SKY_FALLS_DOWN,
+                        duration_s=400.0,
+                    )
+                ],
+                1.00,
+            ),
+            ("OceanLab", SKY_FALLS_DOWN, [_no_length_hit("OceanLab")], 0.94),
+            (
+                "OceanLab feat. Justine Suissa",
+                SKY_FALLS_DOWN,
+                [_no_length_hit("OceanLab feat. Justine Suissa")],
+                0.67,
+            ),
+            ("OceanLab featuring Justine Suissa", SKY_FALLS_DOWN, [], 0.70),
+            (
+                "OceanLab",
+                "Sky Falls Down (feat. Justine Suissa) (Armin van Buuren Remix)",
+                [],
+                0.87,
+            ),
+            (
+                "OceanLab",
+                "Sky Falls Down (Armin van Buuren Remix) [feat. Justine Suissa]",
+                [],
+                0.87,
+            ),
+        ],
+    )
+    def test_the_right_recording_is_chosen(
+        self,
+        db: sqlite3.Connection,
+        tmp_path: Path,
+        artist: str,
+        title: str,
+        decoys: list[RecordingMatch],
+        score: float,
+    ) -> None:
+        path = _write_silent_flac(
+            tmp_path / "sky.flac", {"artist": artist, "title": title}
+        )
+        client = StubClient(
+            search_matches=[_EXTENDED_MIX, *decoys, _sky_falls_down_hit(score)]
+        )
+
+        [diff] = generate_diff(
+            db, [path], client=client, lookup_cfg=_cfg(fingerprint_enabled=False)
+        )
+
+        assert client.recording_ids == [SKY_FALLS_DOWN_ID]
+        assert "identity: mb-search" in diff.notes
 
 
 # ---------------------------------------------------------------------------
